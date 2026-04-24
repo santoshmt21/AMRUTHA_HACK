@@ -418,7 +418,7 @@ export default function Hero() {
                 whileTap={{ scale: 0.98 }}
                 transition={{ duration: 0.2 }}
               >
-                Get Started →
+                Log In
               </motion.button>
 
               {/* Secondary CTA */}

@@ -1,22 +1,22 @@
+import { Inter } from "next/font/google";
 import "./globals.css";
+import { AuthProvider } from "../app/contexts/AuthContext.js";
+
+const inter = Inter({ subsets: ["latin"] });
 
 export const metadata = {
-  title: "VitalDecode — AI Health Intelligence",
-  description: "AI-powered insights that simplify complex medical data into clear, actionable explanations.",
+  title: "VitalDecode - AI Health Report Analysis",
+  description: "Understand your health reports instantly with AI-powered insights",
 };
 
 export default function RootLayout({ children }) {
   return (
     <html lang="en">
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link
-          href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700;800&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;600&display=swap"
-          rel="stylesheet"
-        />
-      </head>
-      <body className="antialiased">{children}</body>
+      <body className={inter.className}>
+        <AuthProvider>
+          {children}
+        </AuthProvider>
+      </body>
     </html>
   );
 }
