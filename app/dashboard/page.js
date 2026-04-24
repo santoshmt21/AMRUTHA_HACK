@@ -2,6 +2,7 @@
 
 import { motion, AnimatePresence } from "framer-motion";
 import { useState } from "react";
+import { useAuth } from "@/app/contexts/AuthContext.js";
 
 const fadeUp = {
   hidden: { opacity: 0, y: 18 },
@@ -284,10 +285,18 @@ function PanelInsurance() {
 }
 
 function PanelProfile() {
+  const { user } = useAuth();
+  const profileFields = [
+    { label:"Date of birth", value:user?.dob || "Jan 12, 2003" },
+    { label:"Blood type", value:user?.bloodType || "A+" },
+    { label:"Height", value:user?.height ? `${user.height} cm` : "175.5 cm" },
+    { label:"Weight", value:user?.weight ? `${user.weight} kg` : "52 kg" },
+  ];
+
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
       <p style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.78rem", color:"#0a1f36" }}>Profile</p>
-      {[{ label:"Date of birth", value:"Jan 12, 2003" }, { label:"Blood type", value:"A+" }, { label:"Height", value:"175.5 cm" }, { label:"Weight", value:"52 kg" }].map(f => (
+      {profileFields.map(f => (
         <div key={f.label} style={{ ...card, padding:"10px 14px", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
           <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", color:"#5a7fa0" }}>{f.label}</span>
           <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.76rem", fontWeight:600, color:"#1e3a5f" }}>{f.value}</span>
@@ -311,6 +320,16 @@ const rightPanelContent = {
 // ─── CENTER CONTENT VIEWS ─────────────────────────────────────────────────────
 
 function CenterHome({ setActiveNav }) {
+  const { user } = useAuth();
+  const displayName = user?.name || "Guest";
+  const summaryFields = [
+    { label:"Sex", value:user?.sex || "Male" },
+    { label:"Age", value:user?.age ? `${user.age} y/o` : "23 y/o" },
+    { label:"Height", value:user?.height ? `${user.height} cm` : "175.5 cm" },
+    { label:"Weight", value:user?.weight ? `${user.weight} kg` : "52 kg" },
+    { label:"Blood type", value:user?.bloodType || "A+" },
+  ];
+
   return (
     <div style={{ padding:"20px 24px 28px" }}>
       {/* Patient header */}
@@ -318,12 +337,12 @@ function CenterHome({ setActiveNav }) {
         style={{ ...card, padding:"18px 22px", marginBottom:18, display:"flex", alignItems:"center", gap:18, flexWrap:"wrap", position:"relative", overflow:"hidden" }}>
         <div style={{ position:"absolute", right:0, top:0, width:160, height:"100%", background:"linear-gradient(270deg,rgba(15,76,129,0.04),transparent)", borderRadius:"0 18px 18px 0" }}/>
         <div style={{ width:60, height:60, borderRadius:"50%", background:"linear-gradient(135deg,#0f4c81,#1a7a5e)", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
-          <span style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"1.3rem", color:"white" }}>S</span>
+          <span style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"1.3rem", color:"white" }}>{displayName.charAt(0).toUpperCase()}</span>
         </div>
         <div style={{ flex:1 }}>
-          <p style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.96rem", color:"#0a1f36", marginBottom:8 }}>Hello, Santosh 👋</p>
+          <p style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.96rem", color:"#0a1f36", marginBottom:8 }}>Hello, {displayName} 👋</p>
           <div style={{ display:"flex", gap:22, flexWrap:"wrap" }}>
-            {[{ label:"Sex", value:"Male" }, { label:"Age", value:"23 y/o" }, { label:"Height", value:"175.5 cm" }, { label:"Weight", value:"52 kg" }, { label:"Blood type", value:"A+" }].map(s => (
+            {summaryFields.map(s => (
               <div key={s.label}>
                 <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.6rem", color:"#5a7fa0", fontWeight:700, textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:2 }}>{s.label}</p>
                 <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.82rem", color:"#1e3a5f", fontWeight:600 }}>{s.value}</p>

@@ -11,15 +11,40 @@ export function AuthProvider({ children }) {
   const router = useRouter();
 
   useEffect(() => {
-    // Check if user is logged in
     const token = localStorage.getItem('token');
-    const userData = localStorage.getItem('user');
-
-    if (token && userData) {
-      setUser(JSON.parse(userData));
+    if (!token) {
+      setLoading(false);
+      return;
     }
-    setLoading(false);
-  }, []);
+
+    async function loadUser() {
+      try {
+        const response = await fetch('/api/auth/me', {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (!response.ok) {
+          throw new Error('Session invalid');
+        }
+
+        const data = await response.json();
+        setUser(data.user);
+        localStorage.setItem('user', JSON.stringify(data.user));
+      } catch (error) {
+        console.error('Auth fetch error:', error);
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        setUser(null);
+        router.push('/login');
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    loadUser();
+  }, [router]);
 
   const logout = async () => {
     try {
