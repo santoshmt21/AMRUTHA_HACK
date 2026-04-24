@@ -5,6 +5,17 @@
   --foreground: #171717;
 }
 
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+ 
+html, body {
+  margin: 0;
+  padding: 0;
+  scroll-behavior: smooth;
+}
+ 
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
