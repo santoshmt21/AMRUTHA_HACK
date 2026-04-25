@@ -4,6 +4,7 @@ import { motion } from "framer-motion";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { useAuth } from "../contexts/AuthContext.js";
 
 const fadeUp = {
   hidden: { opacity: 0, y: 20 },
@@ -11,6 +12,7 @@ const fadeUp = {
 };
 
 export default function SignupPage() {
+  const { setUser } = useAuth();
 
   console.log('Environment check:', {
   hasMongoURI: !!process.env.MONGODB_URI,
@@ -108,6 +110,7 @@ export default function SignupPage() {
       // Store token in localStorage
       localStorage.setItem("token", data.token);
       localStorage.setItem("user", JSON.stringify(data.user));
+      setUser(data.user);
 
       // Redirect to dashboard
       router.push("/dashboard");

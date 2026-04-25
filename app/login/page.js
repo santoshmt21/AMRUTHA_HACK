@@ -4,6 +4,7 @@ import { motion } from "framer-motion";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { useAuth } from "../contexts/AuthContext.js";
 
 const fadeUp = {
   hidden: { opacity: 0, y: 20 },
@@ -12,6 +13,7 @@ const fadeUp = {
 
 export default function LoginPage() {
   const router = useRouter();
+  const { setUser } = useAuth();
   const [formData, setFormData] = useState({
     email: "",
     password: "",
@@ -82,6 +84,7 @@ export default function LoginPage() {
       // Store token in localStorage
       localStorage.setItem("token", data.token);
       localStorage.setItem("user", JSON.stringify(data.user));
+      setUser(data.user);
 
       // Redirect to dashboard
       router.push("/dashboard");

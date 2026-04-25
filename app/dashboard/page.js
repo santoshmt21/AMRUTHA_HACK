@@ -1,7 +1,7 @@
 "use client";
 
 import { motion, AnimatePresence } from "framer-motion";
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useAuth } from "@/app/contexts/AuthContext.js";
 
 const fadeUp = {
@@ -418,6 +418,15 @@ function CenterHome({ setActiveNav }) {
 // ─── HEALTH DASHBOARD (Image 8) ───────────────────────────────────────────────
 function CenterHealth() {
   const [period, setPeriod] = useState("7D");
+  const [reportFile, setReportFile] = useState(null);
+  const [isDraggingReport, setIsDraggingReport] = useState(false);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportLoadMessage, setReportLoadMessage] = useState("");
+  const [reportError, setReportError] = useState("");
+  const [reportResult, setReportResult] = useState(null);
+  const [reportSearch, setReportSearch] = useState("");
+  const [reportStatusFilter, setReportStatusFilter] = useState("All");
+  const reportInputRef = useRef(null);
   const vitals = [
     { label:"Heart Rate", value:"74", unit:"bpm", status:"Normal", statusColor:"#22c55e", icon:"❤️", emoji:"💓" },
     { label:"Blood Pressure", value:"122/80", unit:"mmHg", status:"Stage 1 HTN", statusColor:"#f59e0b", icon:"🫀", emoji:"🫀" },
@@ -439,6 +448,127 @@ function CenterHealth() {
     const ys = pts.map(p => h - ((p-min)/(max-min||1))*h);
     return xs.map((x,i) => `${i===0?"M":"L"}${x},${ys[i]}`).join(" ");
   };
+
+  const handleReportFile = (file) => {
+    setReportFile(file || null);
+    setReportError("");
+    setReportResult(null);
+    setReportSearch("");
+    setReportStatusFilter("All");
+  };
+
+  const analyzeHealthReport = async () => {
+    if (!reportFile) {
+      setReportError("Please upload a file first.");
+      return;
+    }
+
+    setReportLoading(true);
+    setReportError("");
+    setReportResult(null);
+
+    let step = 0;
+    setReportLoadMessage(healthLoadMessages[0]);
+    const interval = setInterval(() => {
+      step = Math.min(step + 1, healthLoadMessages.length - 1);
+      setReportLoadMessage(healthLoadMessages[step]);
+    }, 1600);
+
+    try {
+      const base64 = await fileToBase64(reportFile);
+      const isImage = reportFile.type.startsWith("image/");
+      const isPdf = reportFile.type === "application/pdf";
+      let messages;
+
+      if (isImage) {
+        messages = [{
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: `data:${reportFile.type};base64,${base64}` } },
+            { type: "text", text: HEALTH_EXTRACT_PROMPT },
+          ],
+        }];
+      } else if (isPdf) {
+        messages = [{
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `${HEALTH_EXTRACT_PROMPT}\n\nThis is the raw base64 content of a PDF medical report. Decode and analyze it:\n${base64.substring(0, 8000)}`,
+            },
+          ],
+        }];
+      } else {
+        const text = await reportFile.text().catch(() => "Could not read file as text.");
+        messages = [{ role: "user", content: `${HEALTH_EXTRACT_PROMPT}\n\nDocument text:\n${text}` }];
+      }
+
+      const raw = await callOpenRouter(messages, 4000);
+      const cleaned = String(raw || "").replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+
+      let parsed;
+      try {
+        parsed = JSON.parse(cleaned);
+      } catch {
+        const match = cleaned.match(/\{[\s\S]*\}/);
+        if (match) parsed = JSON.parse(match[0]);
+        else throw new Error("Model returned non-JSON response. Try a clearer image or PDF.");
+      }
+
+      if (!Array.isArray(parsed?.parameters)) {
+        parsed.parameters = [];
+      }
+
+      const token = localStorage.getItem("token");
+      if (!token) {
+        throw new Error("Session expired. Please login again.");
+      }
+
+      const storeResponse = await fetch("/api/blood-det", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          date: parsed?.patientInfo?.date || new Date().toISOString(),
+          parameters: (parsed.parameters || []).map((p) => ({
+            name: p?.name,
+            value: p?.value,
+          })),
+        }),
+      });
+
+      const storeData = await storeResponse.json();
+      if (!storeResponse.ok) {
+        throw new Error(storeData?.error || "Failed to store BLOOD_DET rows");
+      }
+
+      setReportResult(parsed);
+    } catch (error) {
+      setReportError(error?.message || "Unknown error while analyzing report.");
+    } finally {
+      clearInterval(interval);
+      setReportLoading(false);
+    }
+  };
+
+  const filteredHealthParameters = (reportResult?.parameters || []).filter((p) => {
+    const name = String(p?.name || "").toLowerCase();
+    const value = String(p?.value || "").toLowerCase();
+    const query = reportSearch.toLowerCase();
+    const matchSearch = name.includes(query) || value.includes(query);
+    const matchStatus =
+      reportStatusFilter === "All" ||
+      String(p?.status || "").toLowerCase() === reportStatusFilter.toLowerCase();
+    return matchSearch && matchStatus;
+  });
+
+  const healthStatusCounts = (reportResult?.parameters || []).reduce((acc, p) => {
+    const status = String(p?.status || "Unknown");
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
 
   return (
     <div style={{ padding:"20px 24px 28px" }}>
@@ -462,6 +592,207 @@ function CenterHealth() {
           </motion.button>
         </div>
       </motion.div>
+
+      {/* Upload report card */}
+      <motion.div custom={1} variants={fadeUp} initial="hidden" animate="visible"
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDraggingReport(true);
+        }}
+        onDragLeave={() => setIsDraggingReport(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setIsDraggingReport(false);
+          handleReportFile(e.dataTransfer.files?.[0]);
+        }}
+        onClick={() => reportInputRef.current?.click()}
+        style={{
+          ...card,
+          marginBottom:18,
+          padding:"42px 20px",
+          minHeight:220,
+          display:"flex",
+          flexDirection:"column",
+          alignItems:"center",
+          justifyContent:"center",
+          gap:12,
+          textAlign:"center",
+          cursor:"pointer",
+          border:`1.5px dashed ${isDraggingReport ? "#0f4c81" : "rgba(15,76,129,0.2)"}`,
+          background:isDraggingReport ? "rgba(15,76,129,0.04)" : "rgba(255,255,255,0.72)",
+        }}>
+        <input
+          ref={reportInputRef}
+          type="file"
+          accept="image/*,.pdf,.docx,.txt"
+          style={{ display:"none" }}
+          onChange={(e) => handleReportFile(e.target.files?.[0])}
+        />
+        <div style={{ width:64, height:64, borderRadius:999, background:"rgba(34,199,138,0.22)", display:"flex", alignItems:"center", justifyContent:"center" }}>
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#1a7a5e" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="16 16 12 12 8 16"/>
+            <line x1="12" y1="12" x2="12" y2="21"/>
+            <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
+          </svg>
+        </div>
+        <div>
+          <p style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"1rem", color:"#0a1f36", marginBottom:4 }}>Drop your medical report here</p>
+          <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.75rem", color:"#5a7fa0" }}>Blood reports · MRI · X-ray · Pregnancy scans · ECG · Any medical document</p>
+        </div>
+      </motion.div>
+
+      {reportFile && (
+        <div style={{ ...card, marginBottom:18, padding:"12px 14px", display:"flex", alignItems:"center", gap:10, background:"rgba(34,197,94,0.07)", border:"1px solid rgba(34,197,94,0.25)" }}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0f4c81" strokeWidth="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.75rem", color:"#1e3a5f", fontWeight:600, flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+            {reportFile.name} ({(reportFile.size / 1024).toFixed(0)} KB)
+          </span>
+          <button onClick={(e) => { e.stopPropagation(); handleReportFile(null); }} style={{ border:"none", background:"none", cursor:"pointer", color:"#64748b", fontSize:"0.95rem" }}>x</button>
+        </div>
+      )}
+
+      <button
+        onClick={analyzeHealthReport}
+        disabled={!reportFile || reportLoading}
+        style={{
+          width:"100%",
+          marginBottom:18,
+          padding:"13px 16px",
+          borderRadius:14,
+          border:"none",
+          cursor: reportFile && !reportLoading ? "pointer" : "not-allowed",
+          background: reportFile && !reportLoading ? "linear-gradient(135deg,#0f4c81,#1a7a5e)" : "#9ca3af",
+          color:"white",
+          fontFamily:"'Sora',sans-serif",
+          fontWeight:700,
+          fontSize:"0.88rem",
+          boxShadow: reportFile && !reportLoading ? "0 4px 14px rgba(15,76,129,0.25)" : "none",
+        }}
+      >
+        {reportLoading ? reportLoadMessage || "Analyzing..." : "Analyze Report"}
+      </button>
+
+      {reportError && (
+        <div style={{ ...card, marginBottom:18, padding:"12px 14px", border:"1px solid rgba(239,68,68,0.3)", background:"rgba(254,226,226,0.75)" }}>
+          <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.74rem", color:"#b91c1c", fontWeight:600 }}>{reportError}</p>
+        </div>
+      )}
+
+      {reportResult && (
+        <motion.div custom={2} variants={fadeUp} initial="hidden" animate="visible" style={{ ...card, marginBottom:18, padding:"16px" }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10, flexWrap:"wrap", marginBottom:10 }}>
+            <div>
+              <h3 style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.95rem", color:"#0a1f36" }}>
+                {reportResult.reportTitle || "Medical Report"}
+              </h3>
+              {reportResult.patientInfo && (
+                <div style={{ display:"flex", gap:12, flexWrap:"wrap", marginTop:4 }}>
+                  {Object.entries(reportResult.patientInfo)
+                    .filter(([, value]) => value)
+                    .map(([key, value]) => (
+                      <span key={key} style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.7rem", color:"#64748b" }}>
+                        <span style={{ textTransform:"capitalize", color:"#475569" }}>{key}:</span> {value}
+                      </span>
+                    ))}
+                </div>
+              )}
+            </div>
+            <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+              {Object.entries(healthStatusCounts).map(([status, count]) => {
+                const c = healthStatusColor(status);
+                return (
+                  <span key={status} style={{ background:c.bg, border:`1px solid ${c.border}`, borderRadius:999, padding:"4px 10px", fontFamily:"'DM Sans',sans-serif", fontSize:"0.67rem", fontWeight:700, color:c.text }}>
+                    {status}: {count}
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+
+          <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:10 }}>
+            <input
+              value={reportSearch}
+              onChange={(e) => setReportSearch(e.target.value)}
+              placeholder="Search parameters"
+              style={{ flex:1, minWidth:180, padding:"8px 10px", borderRadius:8, border:"1px solid rgba(15,76,129,0.2)", fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", color:"#1e3a5f", background:"rgba(255,255,255,0.9)", outline:"none" }}
+            />
+            {[
+              "All",
+              "Normal",
+              "High",
+              "Low",
+              "Critical",
+              "Unknown",
+            ].map((status) => (
+              <button
+                key={status}
+                onClick={() => setReportStatusFilter(status)}
+                style={{
+                  padding:"7px 10px",
+                  borderRadius:8,
+                  cursor:"pointer",
+                  fontFamily:"'DM Sans',sans-serif",
+                  fontSize:"0.68rem",
+                  fontWeight:600,
+                  border: reportStatusFilter === status ? "none" : "1px solid rgba(15,76,129,0.2)",
+                  background: reportStatusFilter === status ? "linear-gradient(135deg,#0f4c81,#1a7a5e)" : "rgba(255,255,255,0.9)",
+                  color: reportStatusFilter === status ? "white" : "#3d5a7a",
+                }}
+              >
+                {status}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ border:"1px solid rgba(15,76,129,0.12)", borderRadius:12, overflow:"hidden" }}>
+            <div style={{ overflowX:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", minWidth:700 }}>
+                <thead>
+                  <tr style={{ background:"rgba(15,76,129,0.06)" }}>
+                    {[
+                      "Parameter",
+                      "Value",
+                      "Unit",
+                      "Reference Range",
+                      "Status",
+                    ].map((heading) => (
+                      <th key={heading} style={{ textAlign:"left", padding:"10px 12px", fontFamily:"'DM Sans',sans-serif", fontSize:"0.65rem", textTransform:"uppercase", letterSpacing:"0.06em", color:"#5a7fa0" }}>
+                        {heading}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredHealthParameters.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} style={{ padding:"18px", textAlign:"center", fontFamily:"'DM Sans',sans-serif", fontSize:"0.74rem", color:"#64748b" }}>
+                        No parameters match your filter.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredHealthParameters.map((parameter, index) => {
+                      const c = healthStatusColor(parameter?.status);
+                      return (
+                        <tr key={`${parameter?.name || "param"}-${index}`} style={{ borderTop:"1px solid rgba(15,76,129,0.08)", background:index % 2 === 0 ? "rgba(255,255,255,0.55)" : "rgba(248,250,252,0.92)" }}>
+                          <td style={{ padding:"10px 12px", fontFamily:"'DM Sans',sans-serif", fontSize:"0.74rem", color:"#1e3a5f", fontWeight:600 }}>{parameter?.name || "-"}</td>
+                          <td style={{ padding:"10px 12px", fontFamily:"'DM Mono',monospace", fontSize:"0.72rem", color:c.text, fontWeight:700 }}>{parameter?.value ?? "-"}</td>
+                          <td style={{ padding:"10px 12px", fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", color:"#475569" }}>{parameter?.unit || "-"}</td>
+                          <td style={{ padding:"10px 12px", fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", color:"#475569" }}>{parameter?.referenceRange || "-"}</td>
+                          <td style={{ padding:"10px 12px" }}>
+                            <span style={{ background:c.bg, border:`1px solid ${c.border}`, borderRadius:999, padding:"2px 8px", fontFamily:"'DM Sans',sans-serif", fontSize:"0.66rem", fontWeight:700, color:c.text, textTransform:"uppercase" }}>
+                              {parameter?.status || "Unknown"}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </motion.div>
+      )}
 
       {/* Vitals row */}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))", gap:12, marginBottom:18 }}>
@@ -641,115 +972,635 @@ function CenterAppointments() {
 }
 
 // ─── UPLOAD / BIO-DATA INGESTION (Image 7) ───────────────────────────────────
+const uploadTranslations = {
+  en: {
+    title: "Medical Report Agent",
+    subtitle: "Upload your report | Get AI analysis | Ask questions by voice or text",
+    uploadLabel: "Drop your medical report here",
+    uploadSub: "Blood reports | MRI | X-ray | Pregnancy scans | ECG | Any medical document",
+    analyzeBtn: "Analyze Report",
+    analyzing: "Analyzing...",
+    welcome: "Report analyzed! Ask me anything about your report.",
+    micStart: "Listening... speak now",
+    placeholder: "Type your question...",
+    readAloud: "Read aloud",
+    summaryTitle: "Report Summary",
+    chatTitle: "Ask the Agent",
+    fileRequired: "Please select a file first",
+    thinking: "Thinking...",
+  },
+  kn: {
+    title: "ವೈದ್ಯಕೀಯ ವರದಿ ಸಹಾಯಕ",
+    subtitle: "ನಿಮ್ಮ ವರದಿ ಅಪ್ಲೋಡ್ ಮಾಡಿ | AI ವಿಶ್ಲೇಷಣೆ | ಧ್ವನಿ ಅಥವಾ ಪಠ್ಯದಲ್ಲಿ ಪ್ರಶ್ನೆ ಕೇಳಿ",
+    uploadLabel: "ನಿಮ್ಮ ವೈದ್ಯಕೀಯ ವರದಿಯನ್ನು ಇಲ್ಲಿ ಹಾಕಿ",
+    uploadSub: "ರಕ್ತ ವರದಿ | MRI | X-ray | ಗರ್ಭಾವಸ್ಥೆ ಸ್ಕ್ಯಾನ್ | ECG | ಯಾವುದೇ ವೈದ್ಯಕೀಯ ದಾಖಲೆ",
+    analyzeBtn: "ವರದಿ ವಿಶ್ಲೇಷಿಸಿ",
+    analyzing: "ವಿಶ್ಲೇಷಿಸಲಾಗುತ್ತಿದೆ...",
+    welcome: "ವರದಿ ವಿಶ್ಲೇಷಿಸಲಾಗಿದೆ! ಈಗ ನಿಮ್ಮ ಪ್ರಶ್ನೆ ಕೇಳಿ.",
+    micStart: "ಕೇಳುತ್ತಿದ್ದೇನೆ... ಮಾತನಾಡಿ",
+    placeholder: "ನಿಮ್ಮ ಪ್ರಶ್ನೆಯನ್ನು ಇಲ್ಲಿ ಟೈಪ್ ಮಾಡಿ...",
+    readAloud: "ಓದಿ ಕೇಳಿಸಿ",
+    summaryTitle: "ವರದಿ ಸಾರಾಂಶ",
+    chatTitle: "ಸಹಾಯಕನನ್ನು ಕೇಳಿ",
+    fileRequired: "ದಯವಿಟ್ಟು ಮೊದಲು ಫೈಲ್ ಆಯ್ಕೆ ಮಾಡಿ",
+    thinking: "ಯೋಚಿಸುತ್ತಿದ್ದೇನೆ...",
+  },
+};
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function cleanTextForSpeech(text) {
+  return String(text || "")
+    .replace(/\*+/g, "")
+    .replace(/#+/g, "")
+    .replace(/_+/g, "")
+    .replace(/`+/g, "")
+    .replace(/\[|\]/g, "")
+    .replace(/\(|\)/g, "")
+    .replace(/\-{2,}/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+async function callOpenRouter(messages, maxTokens = 1200) {
+  const apiKey = process.env.NEXT_PUBLIC_OPENROUTER_API_KEY;
+  if (!apiKey || !apiKey.trim()) {
+    throw new Error("Missing NEXT_PUBLIC_OPENROUTER_API_KEY in .env.local");
+  }
+
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+      "HTTP-Referer": typeof window !== "undefined" ? window.location.origin : "",
+      "X-Title": "Medical Report Agent",
+    },
+    body: JSON.stringify({
+      model: "openrouter/auto",
+      messages,
+      max_tokens: maxTokens,
+      temperature: 0.3,
+    }),
+  });
+
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error?.message || "OpenRouter request failed");
+  return data?.choices?.[0]?.message?.content || "No response.";
+}
+
+function parseStructuredJson(raw) {
+  const cleaned = String(raw || "").replace(/```json|```/gi, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const s = cleaned.indexOf("{");
+    const e = cleaned.lastIndexOf("}");
+    if (s !== -1 && e > s) return JSON.parse(cleaned.slice(s, e + 1));
+    throw new Error("Could not parse JSON from model response");
+  }
+}
+
+function buildExtractionPrompt(lang) {
+  const langRule =
+    lang === "kn"
+      ? "Output language rule: JSON keys must remain in English. All text values must be in Kannada script (except numbers, units, and medical abbreviations)."
+      : "Output language rule: Keep JSON keys in English and values in clear English.";
+
+  return `You are an expert medical data extraction system. Extract ALL important structured information from ANY medical document (blood test, MRI, X-ray, ECG, ultrasound, etc.).\n\nReturn STRICT JSON only:\n{\n  "report_type": "",\n  "patient_info": { "name": "", "age": "", "gender": "", "date": "" },\n  "measurements": [{ "name": "", "value": "", "unit": "", "reference_range": "", "status": "" }],\n  "findings": [],\n  "impression": "",\n  "abnormalities": [],\n  "recommendations": []\n}\n\nRules: Extract ALL values. Set status as Low/Normal/High/Abnormal. Return null for missing fields. No extra text outside JSON.\n${langRule}`;
+}
+
+function buildStandardSummary(data, lang = "en") {
+  const L =
+    lang === "kn"
+      ? {
+          title: "ಪ್ರಮಾಣಿತ ವೈದ್ಯಕೀಯ ವರದಿ ಸಾರಾಂಶ",
+          reportType: "ವರದಿ ಪ್ರಕಾರ",
+          patientName: "ರೋಗಿಯ ಹೆಸರು",
+          age: "ವಯಸ್ಸು",
+          gender: "ಲಿಂಗ",
+          date: "ದಿನಾಂಕ",
+          measurements: "ಮಾಪನಗಳು",
+          findings: "ಕಂಡುಬಂದ ಅಂಶಗಳು",
+          impression: "ವೈದ್ಯಕೀಯ ಅಭಿಪ್ರಾಯ",
+          abnormalities: "ಅಸಾಮಾನ್ಯತೆಗಳು",
+          recommendations: "ಶಿಫಾರಸುಗಳು",
+          range: "ಮಾನದಂಡ",
+          status: "ಸ್ಥಿತಿ",
+          missing: "ಲಭ್ಯವಿಲ್ಲ",
+        }
+      : {
+          title: "STANDARD MEDICAL REPORT SUMMARY",
+          reportType: "Report Type",
+          patientName: "Patient Name",
+          age: "Age",
+          gender: "Gender",
+          date: "Date",
+          measurements: "Measurements",
+          findings: "Findings",
+          impression: "Impression",
+          abnormalities: "Abnormalities",
+          recommendations: "Recommendations",
+          range: "Range",
+          status: "Status",
+          missing: "N/A",
+        };
+
+  const p = data?.patient_info || {};
+  const ms = (data?.measurements || []).map(
+    (m, i) =>
+      `${i + 1}. ${m?.name ?? L.missing}: ${m?.value ?? L.missing} ${m?.unit ?? ""} | ${L.range}: ${m?.reference_range ?? L.missing} | ${L.status}: ${m?.status ?? L.missing}`
+  );
+  const fs = (data?.findings || []).map((f, i) => `${i + 1}. ${f}`);
+  const ab = (data?.abnormalities || []).map((a, i) => `${i + 1}. ${a}`);
+  const rc = (data?.recommendations || []).map((r, i) => `${i + 1}. ${r}`);
+
+  return [
+    L.title,
+    "",
+    `${L.reportType}: ${data?.report_type ?? L.missing}`,
+    `${L.patientName}: ${p?.name ?? L.missing}`,
+    `${L.age}: ${p?.age ?? L.missing}`,
+    `${L.gender}: ${p?.gender ?? L.missing}`,
+    `${L.date}: ${p?.date ?? L.missing}`,
+    "",
+    `${L.measurements}:`,
+    ...(ms.length ? ms : [`1. ${L.missing}`]),
+    "",
+    `${L.findings}:`,
+    ...(fs.length ? fs : [`1. ${L.missing}`]),
+    "",
+    `${L.impression}: ${data?.impression ?? L.missing}`,
+    "",
+    `${L.abnormalities}:`,
+    ...(ab.length ? ab : [`1. ${L.missing}`]),
+    "",
+    `${L.recommendations}:`,
+    ...(rc.length ? rc : [`1. ${L.missing}`]),
+  ].join("\n");
+}
+
+const healthLoadMessages = [
+  "Scanning document structure...",
+  "Running OCR on medical data...",
+  "Identifying test parameters...",
+  "Normalizing units and ranges...",
+  "Classifying result statuses...",
+  "Building diagnostic table...",
+];
+
+const HEALTH_EXTRACT_PROMPT = `You are a medical report parser. Extract ALL medical test parameters from this document.
+
+Return ONLY valid JSON (no markdown fences, no explanation) in this exact schema:
+{
+  "reportTitle": "<inferred report type, e.g. CBC, CMP, Lipid Panel, MRI, etc.>",
+  "patientInfo": { "name": null, "age": null, "date": null, "gender": null },
+  "parameters": [
+    {
+      "name": "<full parameter name>",
+      "value": "<value>",
+      "unit": "<unit or null>",
+      "referenceRange": "<range string or null>",
+      "status": "<Normal|High|Low|Critical|Unknown>"
+    }
+  ],
+  "rawText": "<full extracted text>"
+}
+
+Rules:
+- Expand abbreviations: Hb->Hemoglobin, WBC->White Blood Cells, RBC->Red Blood Cells, Plt->Platelets, Hct->Hematocrit, MCH->Mean Corpuscular Hemoglobin, MCHC->Mean Corpuscular Hemoglobin Concentration, MCV->Mean Corpuscular Volume, ESR->Erythrocyte Sedimentation Rate, CRP->C-Reactive Protein, TSH->Thyroid Stimulating Hormone, FT3->Free Triiodothyronine, FT4->Free Thyroxine, Na->Sodium, K->Potassium, Cl->Chloride, BUN->Blood Urea Nitrogen, Cr->Creatinine, eGFR->Estimated GFR, ALT->Alanine Aminotransferase, AST->Aspartate Aminotransferase, ALP->Alkaline Phosphatase, GGT->Gamma-Glutamyl Transferase, LDL->LDL Cholesterol, HDL->HDL Cholesterol, TG->Triglycerides, HbA1c->Glycated Hemoglobin, FBS->Fasting Blood Sugar, PPBS->Post-Prandial Blood Sugar, PT->Prothrombin Time, INR->International Normalized Ratio, aPTT->Activated Partial Thromboplastin Time
+- Infer status from the reference range if not explicitly stated
+- Ignore headers, patient demographics (put those in patientInfo), and non-parameter text
+- If this is an imaging report (MRI/X-ray/ECG/Ultrasound), extract findings as parameters with name=finding, value=description, status based on whether it is normal/abnormal`;
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function healthStatusColor(status) {
+  switch (String(status || "").toLowerCase()) {
+    case "high":
+      return { bg: "rgba(239,68,68,0.1)", text: "#dc2626", border: "rgba(220,38,38,0.25)" };
+    case "critical":
+      return { bg: "rgba(239,68,68,0.14)", text: "#b91c1c", border: "rgba(185,28,28,0.3)" };
+    case "low":
+      return { bg: "rgba(59,130,246,0.1)", text: "#1d4ed8", border: "rgba(29,78,216,0.25)" };
+    case "normal":
+      return { bg: "rgba(34,197,94,0.1)", text: "#15803d", border: "rgba(21,128,61,0.25)" };
+    default:
+      return { bg: "rgba(100,116,139,0.1)", text: "#475569", border: "rgba(71,85,105,0.25)" };
+  }
+}
+
 function CenterUpload() {
-  const [dragging, setDragging] = useState(false);
-  const [uploaded, setUploaded] = useState(false);
+  const [lang, setLang] = useState("en");
+  const [currentFile, setCurrentFile] = useState(null);
+  const [reportSummary, setReportSummary] = useState("");
+  const [structuredReport, setStructuredReport] = useState(null);
+  const [analysisDone, setAnalysisDone] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [messages, setMessages] = useState([]);
+  const [chatInput, setChatInput] = useState("");
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [alerts, setAlerts] = useState([]);
+  const [isVoiceModal, setIsVoiceModal] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+
+  const fileInputRef = useRef(null);
+  const recognitionRef = useRef(null);
+  const chatAreaRef = useRef(null);
+  const finalTranscriptRef = useRef("");
+
+  const t = uploadTranslations[lang];
+
+  useEffect(() => {
+    if (chatAreaRef.current) {
+      chatAreaRef.current.scrollTop = chatAreaRef.current.scrollHeight;
+    }
+  }, [messages]);
+
+  useEffect(() => {
+    if (structuredReport) {
+      setReportSummary(buildStandardSummary(structuredReport, lang));
+    }
+  }, [lang, structuredReport]);
+
+  const showAlert = (message, type = "warn") => {
+    const id = Date.now();
+    setAlerts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setAlerts((prev) => prev.filter((a) => a.id !== id));
+    }, 5000);
+  };
+
+  const handleFileSelect = (file) => {
+    if (!file) return;
+    if (file.type.startsWith("image/") || file.type === "application/pdf") {
+      setCurrentFile(file);
+      setAnalysisDone(false);
+      setReportSummary("");
+      setStructuredReport(null);
+      setMessages([]);
+      return;
+    }
+    showAlert("Only image or PDF files are supported", "warn");
+  };
+
+  const speak = (text, onEnd) => {
+    if (typeof window === "undefined" || !window.speechSynthesis) return;
+    if (isSpeaking) {
+      window.speechSynthesis.cancel();
+      setIsSpeaking(false);
+      return;
+    }
+
+    const utt = new SpeechSynthesisUtterance(cleanTextForSpeech(text));
+    utt.onstart = () => setIsSpeaking(true);
+    utt.onend = () => {
+      setIsSpeaking(false);
+      if (onEnd) onEnd();
+    };
+    utt.onerror = () => {
+      setIsSpeaking(false);
+      if (onEnd) onEnd();
+    };
+    utt.lang = lang === "kn" ? "kn-IN" : "en-IN";
+    utt.rate = 0.9;
+    utt.pitch = 1;
+    window.speechSynthesis.speak(utt);
+  };
+
+  const stopSpeaking = () => {
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+    setIsSpeaking(false);
+  };
+
+  const analyzeReport = async () => {
+    if (!currentFile) {
+      showAlert(t.fileRequired, "warn");
+      return;
+    }
+
+    setIsAnalyzing(true);
+    setProgress(5);
+    const timer = setInterval(() => setProgress((p) => Math.min(p + 8, 88)), 500);
+
+    try {
+      const dataUrl = await fileToDataUrl(currentFile);
+      const content = [{ type: "text", text: buildExtractionPrompt(lang) }];
+
+      if (currentFile.type === "application/pdf") {
+        content.push({ type: "file", file: { filename: currentFile.name, file_data: dataUrl } });
+      } else {
+        content.push({ type: "image_url", image_url: { url: dataUrl } });
+      }
+
+      const raw = await callOpenRouter([{ role: "user", content }], 2500);
+      const extracted = parseStructuredJson(raw);
+
+      clearInterval(timer);
+      setProgress(100);
+      setTimeout(() => setProgress(0), 600);
+
+      setStructuredReport(extracted);
+      setReportSummary(buildStandardSummary(extracted, lang));
+      setAnalysisDone(true);
+      setMessages([{ role: "system", text: t.welcome }]);
+      showAlert("Analysis complete", "success");
+    } catch (e) {
+      clearInterval(timer);
+      setProgress(0);
+      showAlert("Error: " + e.message, "warn");
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const sendChat = async (override) => {
+    const userMessage = override || chatInput.trim();
+    if (!userMessage || !reportSummary || isChatLoading) return;
+
+    setChatInput("");
+    setMessages((p) => [...p, { role: "user", text: userMessage }]);
+    setIsChatLoading(true);
+    setMessages((p) => [...p, { role: "thinking", text: t.thinking }]);
+
+    try {
+      const prompt =
+        lang === "en"
+          ? `You are a compassionate medical AI assistant. Answer in simple English. Keep answers concise but useful. Do not use markdown. End with a reminder to consult a doctor.\n\nReport summary:\n${reportSummary}\n\nJSON data:\n${structuredReport ? JSON.stringify(structuredReport, null, 2) : "null"}\n\nQuestion:\n${userMessage}`
+          : `ನೀವು ದಯೆಯುಳ್ಳ ವೈದ್ಯಕೀಯ AI ಸಹಾಯಕ. ಸರಳ ಕನ್ನಡದಲ್ಲಿ ಸ್ಪಷ್ಟ ಮತ್ತು ಉಪಯುಕ್ತ ಉತ್ತರ ನೀಡಿ. Markdown ಅಥವಾ ವಿಶೇಷ ಚಿಹ್ನೆಗಳನ್ನು ಬಳಸಬೇಡಿ. ಪ್ರತಿಯೊಂದು ಉತ್ತರದ ಅಂತ್ಯದಲ್ಲಿ ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಲು ನೆನಪಿಸಿ.\n\nವರದಿ ಸಾರಾಂಶ:\n${reportSummary}\n\nJSON ಡೇಟಾ:\n${structuredReport ? JSON.stringify(structuredReport, null, 2) : "null"}\n\nಪ್ರಶ್ನೆ:\n${userMessage}`;
+
+      const reply = await callOpenRouter([{ role: "user", content: [{ type: "text", text: prompt }] }], 700);
+      const finalReply = typeof reply === "string" ? reply : JSON.stringify(reply, null, 2);
+      setMessages((p) => p.filter((m) => m.role !== "thinking"));
+      setMessages((p) => [...p, { role: "agent", text: finalReply }]);
+      speak(finalReply, () => {
+        if (isVoiceModal) setTimeout(toggleMic, 400);
+      });
+    } catch (e) {
+      setMessages((p) => p.filter((m) => m.role !== "thinking"));
+      setMessages((p) => [...p, { role: "agent", text: "Error: " + e.message }]);
+    } finally {
+      setIsChatLoading(false);
+    }
+  };
+
+  const toggleMic = () => {
+    if (!reportSummary) {
+      showAlert("Please analyze a report first", "warn");
+      return;
+    }
+
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      showAlert("Microphone not supported in this browser", "warn");
+      return;
+    }
+
+    if (isListening) {
+      if (recognitionRef.current) recognitionRef.current.stop();
+      setIsListening(false);
+      return;
+    }
+
+    const rec = new SR();
+    rec.lang = lang === "kn" ? "kn-IN" : "en-IN";
+    rec.continuous = false;
+    rec.interimResults = true;
+    rec.onresult = (e) => {
+      finalTranscriptRef.current = Array.from(e.results)
+        .map((r) => r[0].transcript)
+        .join("");
+    };
+    rec.onend = () => {
+      setIsListening(false);
+      if (finalTranscriptRef.current) {
+        sendChat(finalTranscriptRef.current);
+        finalTranscriptRef.current = "";
+      }
+    };
+    rec.onerror = () => setIsListening(false);
+    rec.start();
+    setIsListening(true);
+    recognitionRef.current = rec;
+  };
 
   return (
-    <div style={{ padding:"20px 24px 28px" }}>
-      <motion.div custom={0} variants={fadeUp} initial="hidden" animate="visible" style={{ marginBottom:18 }}>
-        <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.62rem", fontWeight:700, letterSpacing:"0.14em", textTransform:"uppercase", color:"#1a7a5e" }}>CORE INTERFACE</span>
-        <h2 style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"1.5rem", color:"#0a1f36", marginTop:2 }}>
-          Precision Bio-Data<br/><span style={{ color:"#1a7a5e" }}>Ingestion</span>
-        </h2>
-      </motion.div>
-
-      <div style={{ display:"grid", gridTemplateColumns:"1fr 280px", gap:16 }}>
-        <div>
-          {/* Drop zone */}
-          <motion.div custom={1} variants={fadeUp} initial="hidden" animate="visible"
-            onDragOver={e => { e.preventDefault(); setDragging(true); }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={e => { e.preventDefault(); setDragging(false); setUploaded(true); }}
-            style={{ ...card, padding:"48px 24px", display:"flex", flexDirection:"column", alignItems:"center", gap:14, textAlign:"center", marginBottom:16, border:`1.5px dashed ${dragging?"#0f4c81":"rgba(15,76,129,0.2)"}`, background: dragging?"rgba(15,76,129,0.04)":"rgba(255,255,255,0.72)", transition:"all 0.2s" }}>
-            <div style={{ width:64, height:64, borderRadius:18, background:"linear-gradient(135deg,rgba(15,76,129,0.1),rgba(26,122,94,0.1))", display:"flex", alignItems:"center", justifyContent:"center" }}>
-              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#0f4c81" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+    <div style={{ padding: "20px 24px 28px" }}>
+      <div style={{ maxWidth: 980 }}>
+        <motion.div custom={0} variants={fadeUp} initial="hidden" animate="visible" style={{ marginBottom: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 2 }}>
+            <div style={{ width: 38, height: 38, borderRadius: 99, background: "rgba(26,122,94,0.12)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1a7a5e" strokeWidth="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
             </div>
-            <h3 style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"1.1rem", color:"#0a1f36" }}>Drop Medical Records</h3>
-            <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", color:"#5a7fa0", lineHeight:1.6 }}>Securely ingest image reports. Our clinical prism engine will<br/>automatically parse your biomarkers for analysis.</p>
-            <motion.button whileHover={{ scale:1.03 }} whileTap={{ scale:0.97 }}
-              onClick={() => setUploaded(true)}
-              style={{ padding:"8px 22px", borderRadius:10, border:"1.5px solid rgba(15,76,129,0.25)", background:"rgba(255,255,255,0.9)", color:"#0f4c81", fontFamily:"'Sora',sans-serif", fontWeight:600, fontSize:"0.8rem", cursor:"pointer" }}>
-              Browse Files
-            </motion.button>
-          </motion.div>
+            <h2 style={{ fontFamily: "'Sora',sans-serif", fontWeight: 800, fontSize: "1.35rem", color: "#0a1f36" }}>{t.title}</h2>
+          </div>
+          <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: "0.78rem", color: "#5a7fa0" }}>{t.subtitle}</p>
+        </motion.div>
 
-          {/* Uploaded file */}
-          <AnimatePresence>
-            {uploaded && (
-              <motion.div initial={{ opacity:0, y:10 }} animate={{ opacity:1, y:0 }} exit={{ opacity:0 }}
-                style={{ ...card, padding:"12px 16px", marginBottom:12, display:"flex", alignItems:"center", gap:10 }}>
-                <div style={{ width:34, height:34, borderRadius:8, background:"rgba(15,76,129,0.1)", display:"flex", alignItems:"center", justifyContent:"center" }}>
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0f4c81" strokeWidth="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-                </div>
-                <div style={{ flex:1 }}>
-                  <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", fontWeight:600, color:"#1e3a5f" }}>CRP.webp</p>
-                  <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.65rem", color:"#5a7fa0" }}>173.27 KB</p>
-                </div>
-                <button onClick={() => setUploaded(false)} style={{ background:"none", border:"none", cursor:"pointer", color:"#94a3b8" }}>✕</button>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          {/* Extracted text */}
-          <AnimatePresence>
-            {uploaded && (
-              <motion.div initial={{ opacity:0, y:10 }} animate={{ opacity:1, y:0 }} exit={{ opacity:0 }}
-                style={{ ...card, padding:"14px 16px" }}>
-                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
-                  <span style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.82rem", color:"#0a1f36" }}>Extracted Text</span>
-                  <div style={{ display:"flex", gap:8 }}>
-                    {["Copy","Download"].map(b => (
-                      <button key={b} style={{ padding:"4px 12px", borderRadius:7, border:"1px solid rgba(15,76,129,0.15)", background:b==="Download"?"linear-gradient(135deg,#0f4c81,#1a7a5e)":"rgba(255,255,255,0.8)", color:b==="Download"?"white":"#3d5a7a", fontFamily:"'DM Sans',sans-serif", fontSize:"0.68rem", fontWeight:600, cursor:"pointer" }}>{b}</button>
-                    ))}
-                  </div>
-                </div>
-                <div style={{ background:"rgba(15,76,129,0.02)", borderRadius:10, padding:"12px", height:140, overflowY:"auto", fontFamily:"'DM Mono',monospace", fontSize:"0.68rem", color:"#3d5a7a", lineHeight:1.7, border:"1px solid rgba(15,76,129,0.06)" }}>
-                  DRLOGY PATHOLOGY LAB ⊕ 0122456789 | 09123456789<br/>
-                  & Accurate | Caring | Instant drlogy@drlogy.com<br/>
-                  105 –108, SMART VISION COMPLEX, HEALTHCARE ROAD, MUMBAI - 689578<br/>
-                  Yashvi M. Patel | Sample Collected at ANAM<br/>
-                  Age - 21 Years | Sample Collected By: Mr Suresh | Collected on: 03:11 PM 02 Dec<br/>
-                  UHID - 556 1 | Ref. By: Dr. Hiren Shah | Reported on: 04:35 PM 02 Dec<br/><br/>
-                  <strong>C-REACTIVE PROTEIN (CRP)</strong><br/>
-                  C-REACTIVE PROTEIN (CRP) 3.50 Normal 0.00– 5.00 mg/dL<br/>
-                  IMMUNOTURBIDIMETRY<br/>
-                  Interpretation: Measurement of CRP is useful for the detection and evaluation of infection, tissue injury, inflammatory disorders and associated diseases.
-                </div>
-                <div style={{ marginTop:10 }}>
-                  <p style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.78rem", color:"#0a1f36", marginBottom:6 }}>Medical Report Summary</p>
-                  <div style={{ fontFamily:"'DM Mono',monospace", fontSize:"0.7rem", color:"#3d5a7a", lineHeight:1.8 }}>
-                    Age: 21<br/>CRP: 3.5
-                  </div>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
+        <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+          {["en", "kn"].map((l) => (
+            <button
+              key={l}
+              onClick={() => setLang(l)}
+              style={{
+                padding: "7px 14px",
+                borderRadius: 999,
+                border: lang === l ? "none" : "1px solid rgba(15,76,129,0.2)",
+                background: lang === l ? "linear-gradient(135deg,#0f4c81,#1a7a5e)" : "rgba(255,255,255,0.7)",
+                color: lang === l ? "white" : "#3d5a7a",
+                fontFamily: "'DM Sans',sans-serif",
+                fontWeight: 600,
+                fontSize: "0.74rem",
+                cursor: "pointer",
+              }}
+            >
+              {l === "en" ? "English" : "ಕನ್ನಡ"}
+            </button>
+          ))}
         </div>
 
-        {/* Right side */}
-        <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
-          <motion.div custom={2} variants={fadeUp} initial="hidden" animate="visible"
-            style={{ background:"#0a1f36", borderRadius:18, padding:"20px 18px", color:"white" }}>
-            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:12 }}>
-              <div style={{ width:30, height:30, borderRadius:8, background:"rgba(255,255,255,0.1)", display:"flex", alignItems:"center", justifyContent:"center" }}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        {alerts.map((a) => (
+          <div key={a.id} style={{ ...card, marginBottom: 8, padding: "10px 12px", border: a.type === "warn" ? "1px solid rgba(245,158,11,0.3)" : "1px solid rgba(34,197,94,0.3)", background: a.type === "warn" ? "rgba(254,243,199,0.7)" : "rgba(220,252,231,0.7)" }}>
+            <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: "0.75rem", color: a.type === "warn" ? "#92400e" : "#166534" }}>{a.message}</p>
+          </div>
+        ))}
+
+        <motion.div
+          custom={1}
+          variants={fadeUp}
+          initial="hidden"
+          animate="visible"
+          onDragOver={(e) => {
+            e.preventDefault();
+            setIsDragging(true);
+          }}
+          onDragLeave={() => setIsDragging(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setIsDragging(false);
+            handleFileSelect(e.dataTransfer.files[0]);
+          }}
+          onClick={() => fileInputRef.current?.click()}
+          style={{
+            ...card,
+            border: `1.5px dashed ${isDragging ? "#1a7a5e" : "rgba(15,76,129,0.2)"}`,
+            background: isDragging ? "rgba(34,199,138,0.08)" : "rgba(255,255,255,0.72)",
+            padding: "36px 20px",
+            textAlign: "center",
+            cursor: "pointer",
+          }}
+        >
+          <input ref={fileInputRef} type="file" accept="image/*,.pdf" style={{ display: "none" }} onChange={(e) => handleFileSelect(e.target.files?.[0])} />
+          <div style={{ width: 54, height: 54, borderRadius: 99, background: "rgba(26,122,94,0.12)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 10px" }}>
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#1a7a5e" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          </div>
+          <p style={{ fontFamily: "'Sora',sans-serif", fontWeight: 700, fontSize: "0.95rem", color: "#0a1f36", marginBottom: 3 }}>{t.uploadLabel}</p>
+          <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: "0.72rem", color: "#5a7fa0" }}>{t.uploadSub}</p>
+        </motion.div>
+
+        {currentFile && (
+          <div style={{ ...card, marginTop: 10, padding: "10px 12px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: "0.74rem", color: "#1e3a5f" }}>
+              {currentFile.name} ({(currentFile.size / 1024).toFixed(0)} KB)
+            </p>
+            <button onClick={(e) => { e.stopPropagation(); setCurrentFile(null); }} style={{ border: "none", background: "none", cursor: "pointer", color: "#64748b", fontSize: "0.95rem" }}>x</button>
+          </div>
+        )}
+
+        {progress > 0 && (
+          <div style={{ height: 5, borderRadius: 99, background: "rgba(15,76,129,0.1)", marginTop: 10, overflow: "hidden" }}>
+            <div style={{ width: `${progress}%`, height: "100%", background: "linear-gradient(90deg,#22c78a,#0f4c81)", transition: "width 0.3s" }} />
+          </div>
+        )}
+
+        <button
+          onClick={analyzeReport}
+          disabled={!currentFile || isAnalyzing}
+          style={{
+            width: "100%",
+            marginTop: 12,
+            padding: "11px 14px",
+            borderRadius: 10,
+            border: "none",
+            cursor: !currentFile || isAnalyzing ? "not-allowed" : "pointer",
+            color: "white",
+            background: !currentFile || isAnalyzing ? "#9ca3af" : "linear-gradient(135deg,#0f4c81,#1a7a5e)",
+            fontFamily: "'Sora',sans-serif",
+            fontWeight: 600,
+            fontSize: "0.82rem",
+          }}
+        >
+          {isAnalyzing ? t.analyzing : t.analyzeBtn}
+        </button>
+
+        {analysisDone && (
+          <>
+            <div style={{ ...card, marginTop: 14, padding: "16px" }}>
+              <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: "0.66rem", fontWeight: 700, color: "#5a7fa0", marginBottom: 8, letterSpacing: "0.08em", textTransform: "uppercase" }}>{t.summaryTitle}</p>
+              <p style={{ whiteSpace: "pre-wrap", fontFamily: "'DM Sans',sans-serif", fontSize: "0.74rem", color: "#1e3a5f", lineHeight: 1.7 }}>{reportSummary}</p>
+              <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                <button onClick={() => (isSpeaking ? stopSpeaking() : speak(reportSummary))} style={{ padding: "6px 12px", borderRadius: 99, border: "1px solid rgba(15,76,129,0.2)", background: "rgba(255,255,255,0.75)", cursor: "pointer", fontSize: "0.72rem", color: "#3d5a7a" }}>{isSpeaking ? "Stop" : t.readAloud}</button>
+                <button onClick={() => setIsVoiceModal(true)} style={{ padding: "6px 12px", borderRadius: 99, border: "1px solid rgba(34,197,94,0.3)", background: "rgba(220,252,231,0.8)", cursor: "pointer", fontSize: "0.72rem", color: "#166534" }}>Start Voice Conversation</button>
               </div>
-              <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.62rem", fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", color:"rgba(255,255,255,0.5)" }}>ANALYSIS METRIC</span>
             </div>
-            <h3 style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.96rem", color:"white", marginBottom:8 }}>Biological Age Calculation</h3>
-            <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.7rem", color:"rgba(255,255,255,0.55)", lineHeight:1.6, marginBottom:12 }}>Cross-referencing biomarkers from your uploaded report to estimate your system's physiological age.</p>
-            <div style={{ height:4, borderRadius:99, background:"rgba(255,255,255,0.1)" }}>
-              <motion.div initial={{ width:0 }} animate={{ width: uploaded?"75%":"0%" }} transition={{ duration:1.2, ease:"easeOut" }} style={{ height:"100%", borderRadius:99, background:"linear-gradient(90deg,#22c78a,#0f4c81)" }}/>
-            </div>
-          </motion.div>
 
-          <motion.div custom={3} variants={fadeUp} initial="hidden" animate="visible"
-            style={{ ...card, padding:"16px 18px", background:"rgba(255,247,200,0.6)", border:"1px solid rgba(234,179,8,0.2)" }}>
-            <h4 style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.82rem", color:"#854d0e", marginBottom:8 }}>Biological Age Rules</h4>
-            <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", color:"#92400e", lineHeight:1.6 }}>Blood marker values will be used to calculate your biological age. If some values are missing, average population values will be used as defaults.</p>
-          </motion.div>
-        </div>
+            {isVoiceModal && (
+              <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+                <div style={{ ...card, width: "min(460px, 92vw)", padding: "20px" }}>
+                  <h3 style={{ fontFamily: "'Sora',sans-serif", fontWeight: 700, fontSize: "1rem", color: "#0a1f36", marginBottom: 4 }}>Voice Conversation</h3>
+                  <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: "0.74rem", color: "#5a7fa0", marginBottom: 14 }}>Ask me anything about your report.</p>
+                  <div style={{ display: "flex", justifyContent: "center", gap: 12 }}>
+                    <button onClick={toggleMic} style={{ width: 84, height: 84, borderRadius: 999, border: "none", cursor: "pointer", background: isListening ? "#f59e0b" : "#1a7a5e", color: "white", fontWeight: 700 }}>{isListening ? "LISTEN" : "MIC"}</button>
+                    <button onClick={() => { setIsVoiceModal(false); if (isListening && recognitionRef.current) recognitionRef.current.stop(); }} style={{ width: 84, height: 84, borderRadius: 999, border: "none", cursor: "pointer", background: "#dc2626", color: "white", fontWeight: 700 }}>STOP</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div style={{ ...card, marginTop: 14, padding: "16px" }}>
+              <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: "0.66rem", fontWeight: 700, color: "#5a7fa0", marginBottom: 8, letterSpacing: "0.08em", textTransform: "uppercase" }}>{t.chatTitle}</p>
+              <div ref={chatAreaRef} style={{ maxHeight: 260, overflowY: "auto", marginBottom: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+                {messages.map((msg, idx) => (
+                  <div key={idx} style={{ display: "flex", justifyContent: msg.role === "user" ? "flex-end" : "flex-start" }}>
+                    <div style={{
+                      maxWidth: "85%",
+                      padding: "8px 10px",
+                      borderRadius: 10,
+                      fontFamily: "'DM Sans',sans-serif",
+                      fontSize: "0.74rem",
+                      lineHeight: 1.5,
+                      background:
+                        msg.role === "user"
+                          ? "linear-gradient(135deg,#0f4c81,#1a7a5e)"
+                          : msg.role === "agent"
+                          ? "rgba(15,76,129,0.06)"
+                          : "transparent",
+                      color: msg.role === "user" ? "white" : "#1e3a5f",
+                    }}>
+                      {msg.text}
+                      {msg.role === "agent" && (
+                        <div style={{ marginTop: 6 }}>
+                          <button onClick={() => (isSpeaking ? stopSpeaking() : speak(msg.text))} style={{ padding: "4px 10px", borderRadius: 99, border: "1px solid rgba(15,76,129,0.2)", background: "white", cursor: "pointer", fontSize: "0.66rem", color: "#3d5a7a" }}>{isSpeaking ? "Stop" : t.readAloud}</button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <button onClick={toggleMic} style={{ width: 42, height: 42, borderRadius: 999, border: "none", cursor: "pointer", background: isListening ? "#f59e0b" : "#1a7a5e", color: "white" }}>M</button>
+                <input
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && sendChat()}
+                  placeholder={t.placeholder}
+                  style={{ flex: 1, padding: "10px 12px", borderRadius: 8, border: "1px solid rgba(15,76,129,0.2)", outline: "none", fontFamily: "'DM Sans',sans-serif", fontSize: "0.74rem" }}
+                />
+                <button
+                  onClick={() => sendChat()}
+                  disabled={!chatInput.trim() || isChatLoading}
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: 8,
+                    border: "none",
+                    cursor: !chatInput.trim() || isChatLoading ? "not-allowed" : "pointer",
+                    background: !chatInput.trim() || isChatLoading ? "#9ca3af" : "linear-gradient(135deg,#0f4c81,#1a7a5e)",
+                    color: "white",
+                    fontFamily: "'DM Sans',sans-serif",
+                    fontWeight: 700,
+                    fontSize: "0.72rem",
+                  }}
+                >
+                  {isChatLoading ? "..." : "Send"}
+                </button>
+              </div>
+
+              {isListening && (
+                <p style={{ marginTop: 8, fontFamily: "'DM Sans',sans-serif", fontSize: "0.68rem", color: "#64748b", textAlign: "center" }}>{t.micStart}</p>
+              )}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -757,7 +1608,77 @@ function CenterUpload() {
 
 // ─── LIBRARY (Resource Library - Image 6) ────────────────────────────────────
 function CenterLibrary() {
+  const { user } = useAuth();
+  const userEmail = user?.email || "";
   const [formData, setFormData] = useState({ title:"", doctorName:"", hospitalName:"", date:"", subject:"", type:"" });
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState({ message: "", error: "" });
+  const fileInputRef = useRef(null);
+
+  const handleFileSelect = (file) => {
+    if (!file) return;
+    setSelectedFile(file);
+  };
+
+  const submitLibraryItem = async () => {
+    if (!formData.title || !formData.doctorName || !formData.hospitalName || !formData.date) {
+      setUploadStatus({ message: "", error: "Please fill in all required fields." });
+      return;
+    }
+
+    if (!selectedFile) {
+      setUploadStatus({ message: "", error: "Please choose a file to upload." });
+      return;
+    }
+
+    if (!userEmail) {
+      setUploadStatus({ message: "", error: "User email not available. Please login again." });
+      return;
+    }
+
+    const token = localStorage.getItem('token');
+    if (!token) {
+      setUploadStatus({ message: "", error: "Session expired. Please login again." });
+      return;
+    }
+
+    setIsUploading(true);
+    setUploadStatus({ message: "", error: "" });
+
+    try {
+      const payload = new FormData();
+      payload.append('title', formData.title);
+      payload.append('username', userEmail);
+      payload.append('doctorName', formData.doctorName);
+      payload.append('hospitalName', formData.hospitalName);
+      payload.append('date', formData.date);
+      payload.append('subject', formData.subject);
+      payload.append('type', formData.type);
+      payload.append('file', selectedFile);
+
+      const response = await fetch('/api/resource-library', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+        body: payload,
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data?.error || 'Upload failed.');
+      }
+
+      setFormData({ title:"", doctorName:"", hospitalName:"", date:"", subject:"", type:"" });
+      setSelectedFile(null);
+      setUploadStatus({ message: data?.message || 'Report uploaded successfully.', error: "" });
+    } catch (error) {
+      setUploadStatus({ message: "", error: error?.message || 'Upload failed.' });
+    } finally {
+      setIsUploading(false);
+    }
+  };
 
   return (
     <div style={{ padding:"20px 24px 28px" }}>
@@ -768,7 +1689,7 @@ function CenterLibrary() {
 
           {[
             { label:"Title *", key:"title", placeholder:"e.g. X_RAY_01" },
-            { label:"Username *", key:"username", placeholder:"santosh@email.com", disabled:true, value:"santoshtalekattu@gmail.com" },
+            { label:"Username *", key:"username", placeholder:"user@email.com", disabled:true, value:userEmail },
             { label:"Doctor Name *", key:"doctorName", placeholder:"e.g. Swathi" },
             { label:"Hospital Name *", key:"hospitalName", placeholder:"e.g. BGS" },
           ].map(f => (
@@ -787,27 +1708,77 @@ function CenterLibrary() {
 
           <div style={{ marginBottom:14 }}>
             <label style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", fontWeight:600, color:"#3d5a7a", display:"block", marginBottom:5 }}>Date *</label>
-            <input type="date" style={{ width:"100%", padding:"9px 12px", borderRadius:9, border:"1.5px solid rgba(15,76,129,0.15)", background:"rgba(255,255,255,0.8)", fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", color:"#1e3a5f", outline:"none", boxSizing:"border-box" }}/>
+            <input
+              type="date"
+              value={formData.date}
+              onChange={(e) => setFormData((p) => ({ ...p, date: e.target.value }))}
+              style={{ width:"100%", padding:"9px 12px", borderRadius:9, border:"1.5px solid rgba(15,76,129,0.15)", background:"rgba(255,255,255,0.8)", fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", color:"#1e3a5f", outline:"none", boxSizing:"border-box" }}
+            />
           </div>
 
-          {[{ label:"Subject", placeholder:"e.g. subject" }, { label:"Type", placeholder:"e.g. type" }].map(f => (
-            <div key={f.label} style={{ marginBottom:14 }}>
+          {[
+            { key: 'subject', label:"Subject", placeholder:"e.g. subject" },
+            { key: 'type', label:"Type", placeholder:"e.g. type" },
+          ].map(f => (
+            <div key={f.key} style={{ marginBottom:14 }}>
               <label style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", fontWeight:600, color:"#3d5a7a", display:"block", marginBottom:5 }}>{f.label}</label>
-              <input placeholder={f.placeholder} style={{ width:"100%", padding:"9px 12px", borderRadius:9, border:"1.5px solid rgba(15,76,129,0.15)", background:"rgba(255,255,255,0.8)", fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", color:"#1e3a5f", outline:"none", boxSizing:"border-box" }}/>
+              <input
+                placeholder={f.placeholder}
+                value={formData[f.key]}
+                onChange={(e) => setFormData((p) => ({ ...p, [f.key]: e.target.value }))}
+                style={{ width:"100%", padding:"9px 12px", borderRadius:9, border:"1.5px solid rgba(15,76,129,0.15)", background:"rgba(255,255,255,0.8)", fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", color:"#1e3a5f", outline:"none", boxSizing:"border-box" }}
+              />
             </div>
           ))}
 
           <div style={{ marginBottom:18 }}>
             <label style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", fontWeight:600, color:"#3d5a7a", display:"block", marginBottom:5 }}>File *</label>
             <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-              <button style={{ padding:"7px 14px", borderRadius:8, border:"1.5px solid rgba(15,76,129,0.2)", background:"rgba(255,255,255,0.9)", color:"#3d5a7a", fontFamily:"'DM Sans',sans-serif", fontSize:"0.74rem", cursor:"pointer" }}>Choose file</button>
-              <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.74rem", color:"#94a3b8" }}>No file chosen</span>
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                style={{ padding:"7px 14px", borderRadius:8, border:"1.5px solid rgba(15,76,129,0.2)", background:"rgba(255,255,255,0.9)", color:"#3d5a7a", fontFamily:"'DM Sans',sans-serif", fontSize:"0.74rem", cursor:"pointer" }}
+              >
+                Choose file
+              </button>
+              <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.74rem", color:"#94a3b8" }}>
+                {selectedFile ? `${selectedFile.name} (${(selectedFile.size / 1024).toFixed(0)} KB)` : 'No file chosen'}
+              </span>
             </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*,.pdf"
+              style={{ display: 'none' }}
+              onChange={(e) => handleFileSelect(e.target.files?.[0] || null)}
+            />
           </div>
 
+          {uploadStatus.error && (
+            <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", color:"#dc2626", marginBottom:10 }}>{uploadStatus.error}</p>
+          )}
+          {uploadStatus.message && (
+            <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", color:"#16a34a", marginBottom:10 }}>{uploadStatus.message}</p>
+          )}
+
           <motion.button whileHover={{ scale:1.02, boxShadow:"0 8px 24px rgba(15,76,129,0.3)" }} whileTap={{ scale:0.98 }}
-            style={{ width:"100%", padding:"12px", borderRadius:10, border:"none", background:"#2563eb", color:"white", fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.85rem", cursor:"pointer", boxShadow:"0 4px 14px rgba(37,99,235,0.3)" }}>
-            Upload to Library
+            type="button"
+            onClick={submitLibraryItem}
+            disabled={isUploading}
+            style={{
+              width:"100%",
+              padding:"12px",
+              borderRadius:10,
+              border:"none",
+              background:isUploading ? "#94a3b8" : "#2563eb",
+              color:"white",
+              fontFamily:"'Sora',sans-serif",
+              fontWeight:700,
+              fontSize:"0.85rem",
+              cursor:isUploading ? "not-allowed" : "pointer",
+              boxShadow:"0 4px 14px rgba(37,99,235,0.3)",
+            }}>
+            {isUploading ? 'Uploading...' : 'Upload to Library'}
           </motion.button>
 
           <div style={{ marginTop:14, background:"rgba(15,76,129,0.03)", border:"1px solid rgba(15,76,129,0.08)", borderRadius:10, padding:"12px 14px" }}>
@@ -823,29 +1794,473 @@ function CenterLibrary() {
 }
 
 // ─── BIOAGE (Image 4 & 5) ─────────────────────────────────────────────────────
+const BIO_UNITS = {
+  albumin: "g/dL",
+  creatinine: "mg/dL",
+  glucose_mgdl: "mg/dL",
+  crp: "mg/L",
+  lymphocyte_percent: "%",
+  mean_cell_volume: "fL",
+  red_cell_dist_width: "%",
+  alkaline_phosphatase: "U/L",
+  white_blood_cell_count: "10^3/uL",
+};
+
+const BIO_LABELS = {
+  albumin: "Albumin",
+  creatinine: "Creatinine",
+  glucose_mgdl: "Glucose",
+  crp: "CRP",
+  lymphocyte_percent: "Lymphocyte %",
+  mean_cell_volume: "MCV",
+  red_cell_dist_width: "RDW",
+  alkaline_phosphatase: "ALP",
+  white_blood_cell_count: "WBC",
+};
+
+const BIO_RANGES = {
+  albumin: { low: 3.5, high: 5.0, unit: "g/dL" },
+  creatinine_m: { low: 0.74, high: 1.35, unit: "mg/dL" },
+  creatinine_f: { low: 0.59, high: 1.04, unit: "mg/dL" },
+  glucose: { low: 70, high: 100, unit: "mg/dL" },
+  crp: { low: 0, high: 3, unit: "mg/L" },
+  lymphocyte_pct: { low: 20, high: 40, unit: "%" },
+  mcv: { low: 80, high: 100, unit: "fL" },
+  rdw: { low: 11.5, high: 14.5, unit: "%" },
+  alp: { low: 44, high: 147, unit: "U/L" },
+  wbc: { low: 4.5, high: 11, unit: "10^3/uL" },
+};
+
+function clampBio(value, low, high) {
+  return Math.max(low, Math.min(high, value));
+}
+
+function isMissingBio(value) {
+  return value == null || Number.isNaN(Number(value));
+}
+
+function ageDefaults(age) {
+  const a = Number(age);
+  return {
+    albumin: Number(clampBio(4.4 - 0.004 * (a - 20), 3.5, 4.8).toFixed(2)),
+    creatinine: Number(clampBio(0.85 + 0.003 * (a - 40), 0.6, 1.2).toFixed(2)),
+    glucose_mgdl: Number(clampBio(85 + 0.4 * (a - 20), 75, 115).toFixed(1)),
+    crp: Number(clampBio(1 + 0.03 * (a - 20), 0.3, 5).toFixed(2)),
+    lymphocyte_percent: Number(clampBio(34 - 0.18 * (a - 20), 16, 40).toFixed(1)),
+    mean_cell_volume: Number(clampBio(88 + 0.06 * (a - 20), 80, 102).toFixed(1)),
+    red_cell_dist_width: Number(clampBio(12.6 + 0.03 * (a - 20), 11.5, 15.5).toFixed(1)),
+    alkaline_phosphatase: Number(clampBio(72 + 0.8 * (a - 20), 44, 160).toFixed(1)),
+    white_blood_cell_count: Number(clampBio(6.8 - 0.01 * (a - 20), 4.5, 9.5).toFixed(1)),
+  };
+}
+
+function imputeBiomarkers(age, biomarkers) {
+  const defaults = ageDefaults(age);
+  const filled = { ...biomarkers };
+  const defaultsUsed = [];
+
+  Object.entries(defaults).forEach(([field, defaultValue]) => {
+    if (isMissingBio(filled[field])) {
+      filled[field] = defaultValue;
+      defaultsUsed.push({ field, value: defaultValue, unit: BIO_UNITS[field] || "" });
+    }
+  });
+
+  return { filled, defaultsUsed };
+}
+
+function parseNumericValue(value) {
+  let raw = String(value ?? "").trim();
+  if (!raw) return null;
+
+  // Handle locale-decimal values like 10,5 while still supporting 1,234.5.
+  if (raw.includes(",") && !raw.includes(".")) {
+    raw = raw.replace(/,/g, ".");
+  } else {
+    raw = raw.replace(/,/g, "");
+  }
+
+  const match = raw.match(/-?\d*\.?\d+/);
+  if (!match) return null;
+  const num = Number(match[0]);
+  return Number.isFinite(num) ? num : null;
+}
+
+function normalizeBiomarkerValue(key, value) {
+  let v = Number(value);
+  if (!Number.isFinite(v)) return null;
+
+  // Fix common OCR/locale scaling errors and unit alternatives.
+  if (key === "glucose_mgdl") {
+    if (v > 600 && v < 2000) v = v / 10;
+    if (v > 0 && v < 20) v = v * 18.0182;
+  }
+
+  if (key === "creatinine") {
+    if (v > 20) v = v / 88.4; // umol/L to mg/dL
+  }
+
+  if (key === "white_blood_cell_count") {
+    if (v > 1000) v = v / 1000; // cells/uL to 10^3/uL
+    else if (v > 50) v = v / 10; // decimal comma loss: 10,5 -> 105
+  }
+
+  if (key === "red_cell_dist_width" || key === "lymphocyte_percent") {
+    if (v > 100) v = v / 10;
+  }
+
+  if (key === "mean_cell_volume" && v > 300) {
+    v = v / 10;
+  }
+
+  if (key === "crp" && v > 100) {
+    v = v / 10;
+  }
+
+  return Number(v.toFixed(3));
+}
+
+function normalizeBiomarkerName(name) {
+  const n = String(name || "").toLowerCase().trim();
+
+  if (n.includes("albumin")) return "albumin";
+  if (n.includes("creatinine") || n === "cr") return "creatinine";
+  if (n.includes("glucose") || n.includes("fbs") || n.includes("ppbs") || n.includes("blood sugar")) return "glucose_mgdl";
+  if (n === "crp" || n.includes("c-reactive")) return "crp";
+  if (n.includes("lymphocyte")) return "lymphocyte_percent";
+  if (n.includes("mean cell volume") || n.includes("mcv")) return "mean_cell_volume";
+  if (n.includes("red cell dist") || n.includes("rdw")) return "red_cell_dist_width";
+  if (n.includes("alkaline phosphatase") || n === "alp") return "alkaline_phosphatase";
+  if (n.includes("white blood") || n === "wbc") return "white_blood_cell_count";
+
+  return null;
+}
+
+function collectBiomarkersFromRows(rows) {
+  const latest = {};
+  rows.forEach((row) => {
+    const key = normalizeBiomarkerName(row?.name);
+    if (!key || latest[key] != null) return;
+    const parsed = parseNumericValue(row?.value);
+    latest[key] = normalizeBiomarkerValue(key, parsed);
+  });
+  return latest;
+}
+
+function calculateBioAge(age, biomarkers) {
+  const { filled, defaultsUsed } = imputeBiomarkers(age, biomarkers);
+
+  const albumin = Number(filled.albumin);
+  const creatinine = Number(filled.creatinine);
+  const glucoseMgdl = Number(filled.glucose_mgdl);
+  const crp = Number(filled.crp);
+  const lymphocyte = Number(filled.lymphocyte_percent);
+  const mcv = Number(filled.mean_cell_volume);
+  const rdw = Number(filled.red_cell_dist_width);
+  const alp = Number(filled.alkaline_phosphatase);
+  const wbc = Number(filled.white_blood_cell_count);
+
+  if (crp <= 0) {
+    throw new Error("CRP must be greater than 0 for log calculation");
+  }
+
+  const glucose = glucoseMgdl / 18.0182;
+  const xb =
+    -19.907 -
+    0.0336 * albumin +
+    0.0095 * creatinine +
+    0.1953 * glucose +
+    0.0954 * Math.log(crp) -
+    0.012 * lymphocyte +
+    0.0268 * mcv +
+    0.3306 * rdw +
+    0.00188 * alp +
+    0.0554 * wbc +
+    0.0804 * Number(age);
+
+  const gamma = 0.0076927;
+  let m = 1 - Math.exp((-Math.exp(xb) * (Math.exp(120 * gamma) - 1)) / gamma);
+  m = clampBio(m, 0.000001, 0.999999);
+  const biologicalAge = 141.50225 + Math.log(-0.00553 * Math.log(1 - m)) / 0.090165;
+  const diff = biologicalAge - Number(age);
+
+  let interpretation = "Significantly older - Consult a healthcare provider.";
+  if (diff <= -10) interpretation = "Significantly younger - Excellent!";
+  else if (diff <= -5) interpretation = "Younger than chronological age - Good.";
+  else if (diff <= 2) interpretation = "Close to chronological age - Normal.";
+  else if (diff <= 5) interpretation = "Slightly older - Consider lifestyle improvements.";
+  else if (diff <= 10) interpretation = "Older - Health improvements recommended.";
+
+  return {
+    chronologicalAge: Number(age),
+    biologicalAge: Number(biologicalAge.toFixed(1)),
+    ageDifference: Number(diff.toFixed(1)),
+    mortalityScore: Number(m.toFixed(3)),
+    interpretation,
+    defaultsUsed,
+    effectiveBiomarkers: filled,
+  };
+}
+
+function riskLevel(score) {
+  if (score < 25) return { label: "Low Risk", color: "#22c55e" };
+  if (score < 50) return { label: "Moderate Risk", color: "#f59e0b" };
+  if (score < 75) return { label: "High Risk", color: "#ef4444" };
+  return { label: "Very High Risk", color: "#b91c1c" };
+}
+
+function scoreRisk(conditions) {
+  const total = conditions.reduce((sum, item) => sum + item[1], 0);
+  const earned = conditions.reduce((sum, item) => (item[0] ? sum + item[1] : sum), 0);
+  if (!total) return 0;
+  return Number(((earned / total) * 100).toFixed(1));
+}
+
+function classifyBiomarker(value, low, high) {
+  if (value < low * 0.8) return "critical_low";
+  if (value < low) return "low";
+  if (value > high * 1.3) return "critical_high";
+  if (value > high) return "high";
+  return "normal";
+}
+
+function mapBiomarkerStatusColor(status) {
+  if (status === "normal") return { label: "OK", color: "#22c55e", bar: "#22c55e" };
+  if (status === "low" || status === "critical_low") return { label: "LOW", color: "#3b82f6", bar: "#3b82f6" };
+  return { label: "HIGH", color: "#f59e0b", bar: "#ef4444" };
+}
+
+function buildBiomarkerStatuses(values, sex) {
+  const creatRange = String(sex || "male").toLowerCase() === "female" ? BIO_RANGES.creatinine_f : BIO_RANGES.creatinine_m;
+  const checks = [
+    { key: "albumin", value: values.albumin, range: BIO_RANGES.albumin },
+    { key: "creatinine", value: values.creatinine, range: creatRange },
+    { key: "glucose_mgdl", value: values.glucose_mgdl, range: BIO_RANGES.glucose },
+    { key: "crp", value: values.crp, range: BIO_RANGES.crp },
+    { key: "lymphocyte_percent", value: values.lymphocyte_percent, range: BIO_RANGES.lymphocyte_pct },
+    { key: "mean_cell_volume", value: values.mean_cell_volume, range: BIO_RANGES.mcv },
+    { key: "red_cell_dist_width", value: values.red_cell_dist_width, range: BIO_RANGES.rdw },
+    { key: "alkaline_phosphatase", value: values.alkaline_phosphatase, range: BIO_RANGES.alp },
+    { key: "white_blood_cell_count", value: values.white_blood_cell_count, range: BIO_RANGES.wbc },
+  ];
+
+  return checks.map((item) => {
+    const state = classifyBiomarker(item.value, item.range.low, item.range.high);
+    const ui = mapBiomarkerStatusColor(state);
+    return {
+      key: item.key,
+      label: BIO_LABELS[item.key],
+      value: Number(item.value),
+      status: ui.label,
+      color: ui.color,
+      bar: ui.bar,
+      unit: BIO_UNITS[item.key],
+    };
+  });
+}
+
+function computeDiseaseRisks({ age, sex, phenoAge, values }) {
+  const creatRange = String(sex || "male").toLowerCase() === "female" ? BIO_RANGES.creatinine_f : BIO_RANGES.creatinine_m;
+  const albumin = Number(values.albumin);
+  const creatinine = Number(values.creatinine);
+  const glucose = Number(values.glucose_mgdl);
+  const crp = Number(values.crp);
+  const lymphocyte = Number(values.lymphocyte_percent);
+  const mcv = Number(values.mean_cell_volume);
+  const rdw = Number(values.red_cell_dist_width);
+  const alp = Number(values.alkaline_phosphatase);
+  const wbc = Number(values.white_blood_cell_count);
+
+  const risks = [
+    {
+      name: "Cardiovascular Disease",
+      pct: scoreRisk([
+        [crp > 3, 25],
+        [rdw > 14.5, 20],
+        [creatinine > creatRange.high, 15],
+        [glucose > 100, 15],
+        [albumin < 3.5, 10],
+        [wbc > 10, 10],
+        [age > 50, 5],
+      ]),
+      actions: [
+        "Reduce processed foods, sugar, and trans fats to lower inflammation",
+        "Consider Omega-3 supplementation (fish oil 2g/day)",
+      ],
+    },
+    {
+      name: "Type 2 Diabetes",
+      pct: scoreRisk([
+        [glucose > 125, 30],
+        [glucose > 100, 20],
+        [crp > 3, 20],
+        [albumin < 3.8, 15],
+        [age > 45, 10],
+        [wbc > 9, 5],
+      ]),
+      actions: [
+        "Get HbA1c test done to confirm diabetes trend",
+        "Adopt low glycemic index diet and regular activity",
+      ],
+    },
+    {
+      name: "Chronic Kidney Disease",
+      pct: scoreRisk([
+        [creatinine > creatRange.high * 1.3, 30],
+        [creatinine > creatRange.high, 20],
+        [albumin < 3.5, 20],
+        [glucose > 125, 15],
+        [wbc > 10, 10],
+        [age > 60, 5],
+      ]),
+      actions: [
+        "Increase water intake to 2.5 to 3 liters/day",
+        "Avoid frequent NSAID painkillers",
+      ],
+    },
+    {
+      name: "Liver Disease",
+      pct: scoreRisk([
+        [alp > 147 * 1.3, 30],
+        [alp > 147, 20],
+        [albumin < 3.5, 25],
+        [mcv > 100, 15],
+        [wbc > 10, 10],
+      ]),
+      actions: [
+        "Reduce alcohol and fatty foods",
+        "Get ALT and AST panel for full liver picture",
+      ],
+    },
+    {
+      name: "Cancer / Immune Risk",
+      pct: scoreRisk([
+        [lymphocyte < 20, 25],
+        [rdw > 14.5, 25],
+        [crp > 5, 20],
+        [wbc > 11, 15],
+        [albumin < 3.5, 10],
+        [age > 55, 5],
+      ]),
+      actions: [
+        "Support immunity with sleep, Vitamin D, and zinc",
+        "Repeat CBC and inflammation markers in 4 to 6 weeks",
+      ],
+    },
+    {
+      name: "Metabolic Syndrome",
+      pct: scoreRisk([
+        [glucose > 100, 25],
+        [crp > 3, 25],
+        [albumin < 3.8, 20],
+        [rdw > 14, 15],
+        [age > 40, 15],
+      ]),
+      actions: [
+        "Mediterranean diet strongly recommended",
+        "Target 150 min/week moderate aerobic activity",
+      ],
+    },
+  ].map((risk) => {
+    const info = riskLevel(risk.pct);
+    return {
+      ...risk,
+      risk: info.label,
+      riskColor: info.color,
+    };
+  });
+
+  const ageGap = Number((phenoAge - age).toFixed(1));
+  const avgRisk = risks.reduce((sum, risk) => sum + risk.pct, 0) / risks.length;
+  const agePenalty = Math.max(0, ageGap * 1.5);
+  const overallHealthScore = Number(clampBio(100 - avgRisk - agePenalty, 0, 100).toFixed(1));
+  const topPriorityActions = [...new Set(risks.sort((a, b) => b.pct - a.pct).flatMap((risk) => risk.actions))].slice(0, 6);
+
+  return {
+    diseaseRisks: risks,
+    overallHealthScore,
+    topPriorityActions,
+    biomarkerStatuses: buildBiomarkerStatuses(values, sex),
+  };
+}
+
 function CenterBioAge() {
-  const [mode, setMode] = useState("source"); // source | results
+  const { user } = useAuth();
+  const [mode, setMode] = useState("source");
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisError, setAnalysisError] = useState("");
+  const [prediction, setPrediction] = useState(null);
+  const [fetchedRows, setFetchedRows] = useState(0);
 
-  const biomarkers = [
-    { label:"Albumin", value:3.8, status:"OK", color:"#22c55e" },
-    { label:"Creatinine", value:1.3, status:"OK", color:"#22c55e" },
-    { label:"Glucose", value:108, status:"HIGH", color:"#f59e0b" },
-    { label:"CRP", value:3.5, status:"HIGH", color:"#f59e0b" },
-    { label:"Lymphocyte %", value:18, status:"LOW", color:"#3b82f6" },
-    { label:"MCV", value:102, status:"HIGH", color:"#f59e0b" },
-    { label:"RDW", value:15.1, status:"HIGH", color:"#f59e0b" },
-    { label:"ALP", value:160, status:"HIGH", color:"#f59e0b" },
-    { label:"WBC", value:10.5, status:"OK", color:"#22c55e" },
-  ];
+  const runBioAgeAnalysis = async () => {
+    setIsAnalyzing(true);
+    setAnalysisError("");
 
-  const diseases = [
-    { name:"Cardiovascular Disease", pct:70, risk:"High Risk", riskColor:"#ef4444", icon:"❤️" },
-    { name:"Type 2 Diabetes", pct:45, risk:"Moderate Risk", riskColor:"#f59e0b", icon:"💉" },
-    { name:"Chronic Kidney Disease", pct:10, risk:"Low Risk", riskColor:"#22c55e", icon:"⚪" },
-    { name:"Liver Disease", pct:45, risk:"Moderate Risk", riskColor:"#f59e0b", icon:"⚪" },
-    { name:"Cancer / Immune Risk", pct:50, risk:"High Risk", riskColor:"#ef4444", icon:"⚪" },
-    { name:"Metabolic Syndrome", pct:65, risk:"High Risk", riskColor:"#ef4444", icon:"⚪" },
-  ];
+    try {
+      const token = localStorage.getItem("token");
+      if (!token) {
+        throw new Error("Session expired. Please login again.");
+      }
+
+      const response = await fetch("/api/blood-det", {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data?.error || "Unable to fetch BLOOD_DET data");
+      }
+
+      const rows = Array.isArray(data?.rows) ? data.rows : [];
+      setFetchedRows(rows.length);
+      if (rows.length === 0) {
+        throw new Error("No BLOOD_DET rows found. Upload and analyze reports first.");
+      }
+
+      const age = Number(user?.age) > 0 ? Number(user.age) : 30;
+      const sex = String(user?.sex || "male").toLowerCase();
+      const rawBiomarkers = collectBiomarkersFromRows(rows);
+      const bioAge = calculateBioAge(age, rawBiomarkers);
+      const risk = computeDiseaseRisks({
+        age,
+        sex,
+        phenoAge: bioAge.biologicalAge,
+        values: bioAge.effectiveBiomarkers,
+      });
+
+      const trendResponse = await fetch("/api/biotrend", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          bioAge: bioAge.biologicalAge,
+          chronologicalAge: bioAge.chronologicalAge,
+          ageDifference: bioAge.ageDifference,
+          date: new Date().toISOString(),
+        }),
+      });
+
+      const trendData = await trendResponse.json();
+      if (!trendResponse.ok) {
+        throw new Error(trendData?.error || "Unable to save BIOTREND data");
+      }
+
+      setPrediction({
+        ...bioAge,
+        ...risk,
+      });
+      setMode("results");
+    } catch (error) {
+      setAnalysisError(error?.message || "Unable to run analysis");
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
 
   if (mode === "source") {
     return (
@@ -856,10 +2271,10 @@ function CenterBioAge() {
             Predict your<br/><span style={{ color:"#0f4c81" }}>disease risk</span><br/>from blood work
           </h2>
           <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.8rem", color:"#5a7fa0", marginTop:10, lineHeight:1.6 }}>
-            Choose whether to use your latest biomarkers from database or enter values manually, then analyze biological age and disease risks.
+            This will fetch your latest BLOOD_DET biomarkers from Atlas, compute biological age, and generate risk scores.
           </p>
           <div style={{ display:"flex", gap:28, marginTop:16 }}>
-            {[{ val:"9", label:"Biomarkers analysed" }, { val:"6", label:"Disease risks scored" }, { val:"100%", label:"Runs locally" }].map(s => (
+            {[{ val:"9", label:"Biomarkers analysed" }, { val:"6", label:"Disease risks scored" }, { val:String(fetchedRows || "--"), label:"Rows loaded" }].map(s => (
               <div key={s.label}>
                 <p style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"1.3rem", color:"#0a1f36" }}>{s.val}</p>
                 <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.7rem", color:"#5a7fa0" }}>{s.label}</p>
@@ -868,24 +2283,38 @@ function CenterBioAge() {
           </div>
         </motion.div>
 
-        {/* Source selector */}
-        <motion.div custom={1} variants={fadeUp} initial="hidden" animate="visible"
-          style={{ ...card, padding:"16px 18px", marginBottom:16, display:"flex", gap:10, maxWidth:300, position:"absolute", top:80, right:24 }}>
-          <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.68rem", fontWeight:700, color:"#5a7fa0", textTransform:"uppercase", letterSpacing:"0.08em", display:"block", marginBottom:0, width:"100%" }}>MARKER DATA SOURCE</span>
-          {["Use Latest From Database","Enter Manually"].map((b, i) => (
-            <button key={b} style={{ padding:"7px 12px", borderRadius:8, border:`1.5px solid ${i===0?"rgba(15,76,129,0.2)":"rgba(15,76,129,0.08)"}`, background:i===0?"rgba(15,76,129,0.06)":"transparent", color:i===0?"#0f4c81":"#94a3b8", fontFamily:"'DM Sans',sans-serif", fontSize:"0.7rem", fontWeight:600, cursor:"pointer", whiteSpace:"nowrap" }}>{b}</button>
-          ))}
-        </motion.div>
+        {analysisError && (
+          <div style={{ ...card, padding:"12px 14px", marginBottom:14, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(254,226,226,0.75)" }}>
+            <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.74rem", fontWeight:600, color:"#b91c1c" }}>{analysisError}</p>
+          </div>
+        )}
 
         <motion.button custom={2} variants={fadeUp} initial="hidden" animate="visible"
           whileHover={{ scale:1.01, boxShadow:"0 8px 28px rgba(15,76,129,0.3)" }} whileTap={{ scale:0.98 }}
-          onClick={() => setMode("results")}
-          style={{ display:"block", width:"100%", maxWidth:640, padding:"14px", borderRadius:12, border:"none", background:"linear-gradient(135deg,#38bdf8,#0f4c81)", color:"white", fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.88rem", cursor:"pointer", boxShadow:"0 4px 16px rgba(15,76,129,0.25)", marginTop:16 }}>
-          Analyze Biological Age &amp; Disease Risk →
+          onClick={runBioAgeAnalysis}
+          disabled={isAnalyzing}
+          style={{ display:"block", width:"100%", maxWidth:760, padding:"14px", borderRadius:12, border:"none", background:isAnalyzing ? "#94a3b8" : "linear-gradient(135deg,#38bdf8,#0f4c81)", color:"white", fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.88rem", cursor:isAnalyzing ? "not-allowed" : "pointer", boxShadow:isAnalyzing ? "none" : "0 4px 16px rgba(15,76,129,0.25)", marginTop:16 }}>
+          {isAnalyzing ? "Analyzing BLOOD_DET biomarkers..." : "Analyze Biological Age & Disease Risk ->"}
         </motion.button>
       </div>
     );
   }
+
+  if (!prediction) {
+    return (
+      <div style={{ padding:"20px 24px 28px" }}>
+        <button onClick={() => setMode("source")} style={{ padding:"6px 12px", borderRadius:8, border:"1px solid rgba(15,76,129,0.15)", background:"rgba(255,255,255,0.8)", color:"#3d5a7a", fontFamily:"'DM Sans',sans-serif", fontSize:"0.74rem", fontWeight:600, cursor:"pointer" }}>
+          ← Back
+        </button>
+      </div>
+    );
+  }
+
+  const topRiskNames = [...prediction.diseaseRisks]
+    .sort((a, b) => b.pct - a.pct)
+    .slice(0, 2)
+    .map((risk) => `${risk.name} (${risk.pct}%)`)
+    .join(" and ");
 
   return (
     <div style={{ padding:"20px 24px 28px" }}>
@@ -894,28 +2323,26 @@ function CenterBioAge() {
           ← Back
         </button>
         <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.75rem", fontWeight:700, color:"#5a7fa0" }}>BioAge / Disease Risk Engine</span>
-        <span style={{ marginLeft:"auto", fontFamily:"'DM Sans',sans-serif", fontSize:"0.65rem", fontWeight:700, color:"#0f4c81", border:"1.5px solid rgba(15,76,129,0.2)", borderRadius:99, padding:"2px 10px" }}>v2.0 BETA</span>
+        <span style={{ marginLeft:"auto", fontFamily:"'DM Sans',sans-serif", fontSize:"0.65rem", fontWeight:700, color:"#0f4c81", border:"1.5px solid rgba(15,76,129,0.2)", borderRadius:99, padding:"2px 10px" }}>BLOOD_DET</span>
       </div>
 
-      {/* AGE.PY Output */}
       <motion.div custom={0} variants={fadeUp} initial="hidden" animate="visible"
         style={{ ...card, padding:"16px 18px", marginBottom:16, background:"rgba(240,249,255,0.8)", fontFamily:"'DM Mono',monospace", fontSize:"0.74rem", color:"#1e3a5f", lineHeight:2 }}>
-        <span style={{ fontWeight:700, color:"#0f4c81" }}>AGE.PY OUTPUT</span><br/>
-        Chronological age &nbsp;: 21.0 years<br/>
-        Biological age &nbsp;&nbsp;&nbsp;&nbsp;: <span style={{ color:"#ef4444", fontWeight:700 }}>46.5 years</span><br/>
-        Age difference &nbsp;&nbsp;&nbsp;: <span style={{ color:"#ef4444" }}>+25.5 years</span><br/>
-        Mortality score &nbsp;&nbsp;: 0.034<br/>
-        Interpretation &nbsp;&nbsp;&nbsp;: <span style={{ color:"#ef4444" }}>Significantly older – Consult a healthcare provider.</span>
+        <span style={{ fontWeight:700, color:"#0f4c81" }}>AGE OUTPUT</span><br/>
+        Chronological age &nbsp;: {prediction.chronologicalAge.toFixed(1)} years<br/>
+        Biological age &nbsp;&nbsp;&nbsp;&nbsp;: <span style={{ color: prediction.ageDifference > 0 ? "#ef4444" : "#16a34a", fontWeight:700 }}>{prediction.biologicalAge.toFixed(1)} years</span><br/>
+        Age difference &nbsp;&nbsp;&nbsp;: <span style={{ color: prediction.ageDifference > 0 ? "#ef4444" : "#16a34a" }}>{prediction.ageDifference > 0 ? "+" : ""}{prediction.ageDifference.toFixed(1)} years</span><br/>
+        Mortality score &nbsp;&nbsp;: {prediction.mortalityScore}<br/>
+        Interpretation &nbsp;&nbsp;&nbsp;: <span style={{ color: prediction.ageDifference > 0 ? "#ef4444" : "#0f4c81" }}>{prediction.interpretation}</span>
       </motion.div>
 
-      {/* Summary cards */}
       <motion.div custom={1} variants={fadeUp} initial="hidden" animate="visible"
         style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginBottom:16 }}>
         {[
-          { label:"CHRONOLOGICAL AGE", value:"21", sub:"years old", color:"#0a1f36", highlight:false },
-          { label:"BIOLOGICAL AGE", value:"46.5", sub:"phenotypic years", color:"#ef4444", highlight:true },
-          { label:"AGE GAP", value:"+25.5", sub:"± Normal Aging", color:"#ef4444", highlight:false },
-          { label:"HEALTH SCORE", value:"14.2", sub:"out of 100", color:"#f59e0b", highlight:false },
+          { label:"CHRONOLOGICAL AGE", value:String(prediction.chronologicalAge), sub:"years old", color:"#0a1f36", highlight:false },
+          { label:"BIOLOGICAL AGE", value:String(prediction.biologicalAge), sub:"phenotypic years", color:prediction.ageDifference > 0 ? "#ef4444" : "#16a34a", highlight:true },
+          { label:"AGE GAP", value:`${prediction.ageDifference > 0 ? "+" : ""}${prediction.ageDifference}`, sub:"vs chronological", color:prediction.ageDifference > 0 ? "#ef4444" : "#16a34a", highlight:false },
+          { label:"HEALTH SCORE", value:String(prediction.overallHealthScore), sub:"out of 100", color:prediction.overallHealthScore < 50 ? "#f59e0b" : "#22c55e", highlight:false },
         ].map(s => (
           <div key={s.label} style={{ ...card, padding:"14px 16px", border:s.highlight?"2px solid rgba(15,76,129,0.2)":"1px solid rgba(255,255,255,0.9)" }}>
             <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.6rem", fontWeight:700, color:"#5a7fa0", letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:6 }}>{s.label}</p>
@@ -925,57 +2352,44 @@ function CenterBioAge() {
         ))}
       </motion.div>
 
-      {/* Biomarkers & diseases */}
       <motion.div custom={2} variants={fadeUp} initial="hidden" animate="visible" style={{ marginBottom:6 }}>
         <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.65rem", fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", color:"#5a7fa0", marginBottom:10 }}>BIOMARKERS &amp; DISEASE RISKS</p>
       </motion.div>
-      <div style={{ display:"grid", gridTemplateColumns:"200px 1fr", gap:12, marginBottom:16 }}>
-        {/* Biomarker list */}
+      <div style={{ display:"grid", gridTemplateColumns:"220px 1fr", gap:12, marginBottom:16 }}>
         <motion.div custom={3} variants={fadeUp} initial="hidden" animate="visible"
           style={{ ...card, padding:"12px 14px" }}>
-          {biomarkers.map(b => (
-            <div key={b.label} style={{ display:"flex", alignItems:"center", gap:8, padding:"5px 0", borderBottom:"1px solid rgba(15,76,129,0.04)" }}>
-              <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.68rem", color:"#3d5a7a", flex:1 }}>{b.label}</span>
-              <span style={{ fontFamily:"'DM Mono',monospace", fontSize:"0.65rem", color:"#0a1f36", minWidth:32, textAlign:"right" }}>{b.value}</span>
-              <div style={{ width:48, height:4, borderRadius:99, background:"rgba(15,76,129,0.08)" }}>
-                <div style={{ height:"100%", borderRadius:99, width:"60%", background:b.color }}/>
-              </div>
-              <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.6rem", fontWeight:700, color:b.color, minWidth:26 }}>{b.status}</span>
+          {prediction.biomarkerStatuses.map((marker) => (
+            <div key={marker.key} style={{ display:"flex", alignItems:"center", gap:8, padding:"6px 0", borderBottom:"1px solid rgba(15,76,129,0.04)" }}>
+              <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.68rem", color:"#3d5a7a", flex:1 }}>{marker.label}</span>
+              <span style={{ fontFamily:"'DM Mono',monospace", fontSize:"0.65rem", color:"#0a1f36", minWidth:42, textAlign:"right" }}>{marker.value}</span>
+              <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.58rem", color:"#94a3b8", minWidth:40 }}>{marker.unit}</span>
+              <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.6rem", fontWeight:700, color:marker.color, minWidth:28 }}>{marker.status}</span>
             </div>
           ))}
         </motion.div>
 
-        {/* Disease risks */}
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10 }}>
-          {diseases.map((d, i) => (
-            <motion.div key={d.name} custom={i+4} variants={fadeUp} initial="hidden" animate="visible"
+          {prediction.diseaseRisks.map((risk, i) => (
+            <motion.div key={risk.name} custom={i+4} variants={fadeUp} initial="hidden" animate="visible"
               style={{ ...card, padding:"12px 14px" }}>
               <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
-                <span style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"1.1rem", color:d.riskColor }}>{d.pct}%</span>
+                <span style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"1.1rem", color:risk.riskColor }}>{risk.pct}%</span>
               </div>
-              <p style={{ fontFamily:"'DM Sans',sans-serif", fontWeight:700, fontSize:"0.76rem", color:"#0a1f36", marginBottom:3 }}>{d.name}</p>
-              <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.65rem", color:d.riskColor, fontWeight:600, marginBottom:8 }}>{d.risk}</p>
+              <p style={{ fontFamily:"'DM Sans',sans-serif", fontWeight:700, fontSize:"0.76rem", color:"#0a1f36", marginBottom:3 }}>{risk.name}</p>
+              <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.65rem", color:risk.riskColor, fontWeight:600, marginBottom:8 }}>{risk.risk}</p>
               <div style={{ height:4, borderRadius:99, background:"rgba(15,76,129,0.08)" }}>
-                <div style={{ height:"100%", borderRadius:99, width:`${d.pct}%`, background:d.riskColor, transition:"width 0.6s ease" }}/>
+                <div style={{ height:"100%", borderRadius:99, width:`${risk.pct}%`, background:risk.riskColor, transition:"width 0.6s ease" }}/>
               </div>
             </motion.div>
           ))}
         </div>
       </div>
 
-      {/* Priority actions */}
       <motion.div custom={10} variants={fadeUp} initial="hidden" animate="visible">
         <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.65rem", fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", color:"#5a7fa0", marginBottom:10 }}>PRIORITY ACTIONS</p>
         <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10, marginBottom:14 }}>
-          {[
-            "Reduce processed foods, sugar, and trans fats to lower inflammation",
-            "Consider Omega-3 supplementation (fish oil 2g/day)",
-            "Get iron, B12, and folate levels checked",
-            "Limit refined carbohydrates; walk 30 min after meals",
-            "Mediterranean diet strongly recommended",
-            "Target 150 min/week moderate aerobic activity",
-          ].map((action, i) => (
-            <div key={i} style={{ ...card, padding:"12px 14px", display:"flex", gap:10, alignItems:"flex-start" }}>
+          {prediction.topPriorityActions.map((action, i) => (
+            <div key={`${action}-${i}`} style={{ ...card, padding:"12px 14px", display:"flex", gap:10, alignItems:"flex-start" }}>
               <span style={{ width:22, height:22, borderRadius:7, background:"linear-gradient(135deg,#0f4c81,#1a7a5e)", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
                 <span style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"0.65rem", color:"white" }}>{i+1}</span>
               </span>
@@ -987,7 +2401,7 @@ function CenterBioAge() {
         <div style={{ ...card, padding:"16px 18px", background:"rgba(240,249,255,0.8)", border:"1px solid rgba(15,76,129,0.1)" }}>
           <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.65rem", fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", color:"#0f4c81", marginBottom:8 }}>HEALTH SUMMARY</p>
           <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", color:"#3d5a7a", lineHeight:1.7 }}>
-            Biological age is 46.5 years versus chronological age 21, with an age gap of +25.5. Overall health score is 14.2/100, which indicates a low current health profile. Highest risk signals are Cardiovascular Disease (70%) and Metabolic Syndrome (65%). Most deviated biomarkers are CRP (high), Lymphocyte % (low), ALP (high). Priority action: Reduce processed foods, sugar, and trans fats to lower inflammation. Prediction indicates elevated near-term risk progression, so early clinical consultation and aggressive risk-factor management are strongly advised.
+            Biological age is {prediction.biologicalAge} years versus chronological age {prediction.chronologicalAge}, with an age gap of {prediction.ageDifference > 0 ? "+" : ""}{prediction.ageDifference}. Overall health score is {prediction.overallHealthScore}/100. Highest risk signals are {topRiskNames}. Priority action: {prediction.topPriorityActions[0] || "Follow doctor-guided preventive care plan"}. This is a decision-support estimate and not a diagnosis.
           </p>
         </div>
       </motion.div>
@@ -1049,6 +2463,9 @@ function CenterReports() {
 
 // ─── INSURANCE ────────────────────────────────────────────────────────────────
 function CenterInsurance() {
+  const { user } = useAuth();
+  const displayName = user?.name || "User";
+  const userEmail = user?.email || "Not provided";
   return (
     <div style={{ padding:"20px 24px 28px" }}>
       <motion.div custom={0} variants={fadeUp} initial="hidden" animate="visible" style={{ marginBottom:18 }}>
@@ -1079,7 +2496,7 @@ function CenterInsurance() {
           ))}
         </div>
         <div style={{ marginTop:16 }}>
-          <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.7rem", color:"rgba(255,255,255,0.65)" }}>Santosh • santoshtalekattu@gmail.com</p>
+          <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.7rem", color:"rgba(255,255,255,0.65)" }}>{displayName} • {userEmail}</p>
         </div>
       </motion.div>
 
@@ -1107,8 +2524,84 @@ function CenterInsurance() {
 
 // ─── PROFILE (Image 1 patient profile) ───────────────────────────────────────
 function CenterProfile() {
+  const { user, setUser } = useAuth();
   const [activeTab, setActiveTab] = useState("Info");
+  const [isEditingProfile, setIsEditingProfile] = useState(false);
+  const [isSavingProfile, setIsSavingProfile] = useState(false);
+  const [profileDraft, setProfileDraft] = useState({
+    phone: "",
+    dob: "",
+    age: "",
+    bloodType: "",
+    allergies: "",
+    sex: "",
+    height: "",
+    weight: "",
+    bloodPressure: "",
+    heartRate: "",
+    bloodSugar: "",
+  });
   const tabs = ["Info", "Chat", "Doctor Page"];
+  const displayName = user?.name || "User";
+  const displayInitial = displayName.charAt(0).toUpperCase();
+  const displayPatientId = user?._id ? `#${String(user._id).slice(-10).toUpperCase()}` : "Not assigned";
+  const displayDob = user?.dob || "Not provided";
+  const displayAge = user?.age ? ` (Age: ${user.age})` : "";
+
+  useEffect(() => {
+    setProfileDraft({
+      phone: user?.phone || "",
+      dob: user?.dob || "",
+      age: user?.age?.toString() || "",
+      bloodType: user?.bloodType || "",
+      allergies: user?.allergies || "",
+      sex: user?.sex || "",
+      height: user?.height?.toString() || "",
+      weight: user?.weight?.toString() || "",
+      bloodPressure: user?.bloodPressure || "",
+      heartRate: user?.heartRate?.toString() || "",
+      bloodSugar: user?.bloodSugar || "",
+    });
+  }, [user]);
+
+  const handleProfileDraftChange = (field, value) => {
+    setProfileDraft((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const saveProfileChanges = async () => {
+    setIsSavingProfile(true);
+    try {
+      const token = localStorage.getItem("token");
+      const response = await fetch("/api/auth/me", {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          ...profileDraft,
+          age: profileDraft.age ? Number(profileDraft.age) : null,
+          height: profileDraft.height ? Number(profileDraft.height) : null,
+          weight: profileDraft.weight ? Number(profileDraft.weight) : null,
+          heartRate: profileDraft.heartRate ? Number(profileDraft.heartRate) : null,
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Unable to save profile");
+      }
+
+      setUser(data.user);
+      localStorage.setItem("user", JSON.stringify(data.user));
+      setIsEditingProfile(false);
+    } catch (error) {
+      console.error("Profile save error:", error);
+      alert(error.message || "Unable to save profile");
+    } finally {
+      setIsSavingProfile(false);
+    }
+  };
 
   return (
     <div style={{ padding:"20px 24px 28px" }}>
@@ -1116,16 +2609,23 @@ function CenterProfile() {
       <motion.div custom={0} variants={fadeUp} initial="hidden" animate="visible"
         style={{ ...card, padding:"18px 22px", marginBottom:18, display:"flex", alignItems:"center", gap:18, flexWrap:"wrap" }}>
         <div style={{ width:68, height:68, borderRadius:"50%", background:"linear-gradient(135deg,#0f4c81,#1a7a5e)", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
-          <span style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"1.5rem", color:"white" }}>S</span>
+          <span style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"1.5rem", color:"white" }}>{displayInitial}</span>
         </div>
         <div style={{ flex:1 }}>
           <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:4 }}>
-            <h2 style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"1.1rem", color:"#0a1f36" }}>Santosh</h2>
+            <h2 style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"1.1rem", color:"#0a1f36" }}>{displayName}</h2>
             <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.65rem", fontWeight:700, color:"#1a7a5e", background:"rgba(26,122,94,0.1)", padding:"2px 9px", borderRadius:99 }}>Verified</span>
           </div>
-          <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", color:"#5a7fa0" }}>Patient ID: #BGS310120261</p>
+          <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.72rem", color:"#5a7fa0" }}>Patient ID: {displayPatientId}</p>
         </div>
-        <motion.button whileHover={{ scale:1.03 }} whileTap={{ scale:0.97 }} style={{ padding:"7px 16px", borderRadius:9, border:"none", background:"linear-gradient(135deg,#0f4c81,#1a7a5e)", color:"white", fontFamily:"'DM Sans',sans-serif", fontWeight:600, fontSize:"0.76rem", cursor:"pointer" }}>Edit Profile</motion.button>
+        <motion.button
+          whileHover={{ scale:1.03 }}
+          whileTap={{ scale:0.97 }}
+          onClick={() => setIsEditingProfile((prev) => !prev)}
+          style={{ padding:"7px 16px", borderRadius:9, border:"none", background:"linear-gradient(135deg,#0f4c81,#1a7a5e)", color:"white", fontFamily:"'DM Sans',sans-serif", fontWeight:600, fontSize:"0.76rem", cursor:"pointer" }}
+        >
+          {isEditingProfile ? "Cancel" : "Edit Profile"}
+        </motion.button>
       </motion.div>
 
       {/* Tabs */}
@@ -1140,19 +2640,65 @@ function CenterProfile() {
         <motion.div initial={{ opacity:0, y:10 }} animate={{ opacity:1, y:0 }} style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
           <div style={{ ...card, padding:"18px 20px" }}>
             <p style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.84rem", color:"#0a1f36", marginBottom:14 }}>Patient Information</p>
-            {[
-              { label:"Full Name", value:"Santosh", icon:"👤" },
-              { label:"Email Address", value:"santoshtalekattu@gmail.com", icon:"📧" },
-              { label:"Contact Number", value:"9880736838", icon:"📞" },
-              { label:"Date of Birth", value:"2004-01-31 (Age: 23)", icon:"🗓️" },
-              { label:"Blood Type", value:"A+", icon:"🩸" },
-              { label:"Allergies", value:"None", icon:"⚠️" },
-            ].map(f => (
-              <div key={f.label} style={{ padding:"8px 0", borderBottom:"1px solid rgba(15,76,129,0.05)" }}>
-                <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.62rem", color:"#94a3b8", fontWeight:700, textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:2 }}>{f.label}</p>
-                <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", color:"#1e3a5f", fontWeight:500 }}>{f.value}</p>
+            {isEditingProfile ? (
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+                <div style={{ gridColumn:"1 / -1", display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+                  <div style={{ padding:"10px 12px", borderRadius:9, background:"rgba(15,76,129,0.03)", border:"1px solid rgba(15,76,129,0.06)" }}>
+                    <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.62rem", color:"#94a3b8", fontWeight:700, textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:2 }}>Full Name</p>
+                    <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", color:"#1e3a5f", fontWeight:600 }}>{user?.name || "Not provided"}</p>
+                  </div>
+                  <div style={{ padding:"10px 12px", borderRadius:9, background:"rgba(15,76,129,0.03)", border:"1px solid rgba(15,76,129,0.06)" }}>
+                    <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.62rem", color:"#94a3b8", fontWeight:700, textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:2 }}>Email Address</p>
+                    <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", color:"#1e3a5f", fontWeight:600 }}>{user?.email || "Not provided"}</p>
+                  </div>
+                </div>
+                {[
+                  { label:"Contact Number", key:"phone", type:"text" },
+                  { label:"Date of Birth", key:"dob", type:"date" },
+                  { label:"Age", key:"age", type:"number" },
+                  { label:"Blood Type", key:"bloodType", type:"text" },
+                  { label:"Sex", key:"sex", type:"text" },
+                  { label:"Allergies", key:"allergies", type:"text" },
+                  { label:"Height (cm)", key:"height", type:"number" },
+                  { label:"Weight (kg)", key:"weight", type:"number" },
+                  { label:"Blood Pressure", key:"bloodPressure", type:"text" },
+                  { label:"Heart Rate", key:"heartRate", type:"number" },
+                  { label:"Blood Sugar", key:"bloodSugar", type:"text" },
+                ].map((field) => (
+                  <label key={field.key} style={{ display:"flex", flexDirection:"column", gap:4 }}>
+                    <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.62rem", color:"#94a3b8", fontWeight:700, textTransform:"uppercase", letterSpacing:"0.08em" }}>{field.label}</span>
+                    <input
+                      type={field.type}
+                      value={profileDraft[field.key]}
+                      onChange={(e) => handleProfileDraftChange(field.key, e.target.value)}
+                      style={{ padding:"9px 10px", borderRadius:9, border:"1.5px solid rgba(15,76,129,0.15)", background:"rgba(255,255,255,0.95)", fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", color:"#1e3a5f", outline:"none" }}
+                    />
+                  </label>
+                ))}
+                <div style={{ gridColumn:"1 / -1", display:"flex", gap:10, justifyContent:"flex-end", marginTop:6 }}>
+                  <button onClick={() => setIsEditingProfile(false)} style={{ padding:"8px 14px", borderRadius:9, border:"1px solid rgba(15,76,129,0.15)", background:"white", color:"#3d5a7a", fontFamily:"'DM Sans',sans-serif", fontWeight:600, cursor:"pointer" }}>
+                    Cancel
+                  </button>
+                  <button onClick={saveProfileChanges} disabled={isSavingProfile} style={{ padding:"8px 14px", borderRadius:9, border:"none", background:"linear-gradient(135deg,#0f4c81,#1a7a5e)", color:"white", fontFamily:"'DM Sans',sans-serif", fontWeight:600, cursor:"pointer", opacity:isSavingProfile ? 0.75 : 1 }}>
+                    {isSavingProfile ? "Saving..." : "Save Changes"}
+                  </button>
+                </div>
               </div>
-            ))}
+            ) : (
+              [
+                { label:"Full Name", value:user?.name || "Not provided", icon:"👤" },
+                { label:"Email Address", value:user?.email || "Not provided", icon:"📧" },
+                { label:"Contact Number", value:user?.phone || "Not provided", icon:"📞" },
+                { label:"Date of Birth", value:`${displayDob}${displayAge}`, icon:"🗓️" },
+                { label:"Blood Type", value:user?.bloodType || "Not provided", icon:"🩸" },
+                { label:"Allergies", value:user?.allergies || "None", icon:"⚠️" },
+              ].map(f => (
+                <div key={f.label} style={{ padding:"8px 0", borderBottom:"1px solid rgba(15,76,129,0.05)" }}>
+                  <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.62rem", color:"#94a3b8", fontWeight:700, textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:2 }}>{f.label}</p>
+                  <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", color:"#1e3a5f", fontWeight:500 }}>{f.value}</p>
+                </div>
+              ))
+            )}
           </div>
 
           <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
@@ -1160,10 +2706,10 @@ function CenterProfile() {
             <div style={{ ...card, padding:"16px 18px" }}>
               <p style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.82rem", color:"#0a1f36", marginBottom:12 }}>Vital Signs</p>
               {[
-                { label:"Blood Pressure", value:"120/80 mmHg", icon:"❤️", status:"Normal", statusColor:"#22c55e" },
-                { label:"Heart Rate", value:"72 bpm", icon:"💓", status:"Normal", statusColor:"#22c55e" },
-                { label:"Blood Sugar", value:"95 mg/dL", icon:"💉", status:"Normal", statusColor:"#22c55e" },
-                { label:"Weight", value:"165 lbs", icon:"⚖️", status:"Guide", statusColor:"#3b82f6" },
+                { label:"Blood Pressure", value:user?.bloodPressure || "Not recorded", icon:"❤️", status:"Normal", statusColor:"#22c55e" },
+                { label:"Heart Rate", value:user?.heartRate ? `${user.heartRate} bpm` : "Not recorded", icon:"💓", status:"Normal", statusColor:"#22c55e" },
+                { label:"Blood Sugar", value:user?.bloodSugar || "Not recorded", icon:"💉", status:"Normal", statusColor:"#22c55e" },
+                { label:"Weight", value:user?.weight ? `${user.weight} kg` : "Not recorded", icon:"⚖️", status:"Guide", statusColor:"#3b82f6" },
               ].map(v => (
                 <div key={v.label} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"7px 0", borderBottom:"1px solid rgba(15,76,129,0.05)" }}>
                   <div style={{ display:"flex", alignItems:"center", gap:8 }}>
@@ -1236,6 +2782,8 @@ function CenterProfile() {
 
 // ─── DOCTORS / FIND SPECIALIST (Image 3) ─────────────────────────────────────
 function CenterDoctors() {
+  const { user } = useAuth();
+  const displayName = user?.name || "User";
   const [counselingType, setCounselingType] = useState("All types");
   const [city, setCity] = useState("All Cities");
 
@@ -1257,7 +2805,7 @@ function CenterDoctors() {
     <div style={{ padding:"20px 24px 28px" }}>
       {/* Header */}
       <motion.div custom={0} variants={fadeUp} initial="hidden" animate="visible" style={{ marginBottom:16 }}>
-        <h2 style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"1.2rem", color:"#0a1f36" }}>Welcome, Santosh!</h2>
+        <h2 style={{ fontFamily:"'Sora',sans-serif", fontWeight:800, fontSize:"1.2rem", color:"#0a1f36" }}>Welcome, {displayName}!</h2>
         <p style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", color:"#5a7fa0", marginTop:4 }}>Find the best specialist for yourself! Our specialists will help you find the best decisions for solving your problems!</p>
       </motion.div>
 
@@ -1341,6 +2889,8 @@ const centerContent = {
 
 // ─── MAIN DASHBOARD ───────────────────────────────────────────────────────────
 export default function Dashboard() {
+  const { user } = useAuth();
+  const displayName = user?.name || "User";
   const [activeNav, setActiveNav] = useState("home");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const RightContent = rightPanelContent[activeNav] || PanelHome;
@@ -1395,7 +2945,7 @@ export default function Dashboard() {
           <motion.div initial={{ y:-36, opacity:0 }} animate={{ y:0, opacity:1 }} transition={{ duration:0.5, ease:[0.22,1,0.36,1] }}
             style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"11px 20px", gap:10, background:"rgba(255,255,255,0.75)", backdropFilter:"blur(20px)", borderBottom:"1px solid rgba(15,76,129,0.07)", flexShrink:0, zIndex:10 }}>
             <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-              <span style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.88rem", color:"#0a1f36" }}>Santosh</span>
+              <span style={{ fontFamily:"'Sora',sans-serif", fontWeight:700, fontSize:"0.88rem", color:"#0a1f36" }}>{displayName}</span>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2"><polyline points="9 18 15 12 9 6"/></svg>
               <span style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"0.78rem", color:"#5a7fa0", textTransform:"capitalize" }}>{activeNav}</span>
             </div>
